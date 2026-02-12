@@ -14,10 +14,16 @@ import numpy as np
 import torch
 import yaml
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 from tqdm.auto import tqdm
 
-from .data import PackedSequenceDataset, get_dataset_spec, load_corpus_text
+from .data import (
+    PackedMemmapDataset,
+    PackedSequenceDataset,
+    get_dataset_spec,
+    load_corpus_text,
+    write_tokenized_corpus,
+)
 from .model import APELRModel, APELRModelConfig
 from .model_v2 import APELRV2Model, APELRV2ModelConfig
 from .tokenizer import (
@@ -98,7 +104,7 @@ def resolve_batch_size(
     device: torch.device,
     model: torch.nn.Module,
     model_version: str,
-    train_ds: PackedSequenceDataset,
+    train_ds: Dataset,
     use_amp: bool,
     amp_dtype: torch.dtype,
     loss_weights: dict[str, float],
@@ -108,13 +114,16 @@ def resolve_batch_size(
 ) -> int:
     raw = train_cfg.get("batch_size", 1)
     adaptive_cfg = train_cfg.get("adaptive_batch", {})
-    adaptive_enabled = bool(adaptive_cfg) if isinstance(adaptive_cfg, bool) else bool(
-        isinstance(adaptive_cfg, dict) and adaptive_cfg.get("enabled", True)
-    )
+    if isinstance(adaptive_cfg, bool):
+        adaptive_enabled = adaptive_cfg
+    elif isinstance(adaptive_cfg, dict):
+        adaptive_enabled = bool(adaptive_cfg.get("enabled", _is_auto_batch_size(raw)))
+    else:
+        adaptive_enabled = _is_auto_batch_size(raw)
     adaptive_cfg = adaptive_cfg if isinstance(adaptive_cfg, dict) else {}
 
     if not _is_auto_batch_size(raw) and not adaptive_enabled:
-        return int(raw)
+        return max(1, int(raw))
 
     if device.type != "cuda":
         cpu_bs = int(train_cfg.get("cpu_batch_size", raw if not _is_auto_batch_size(raw) else 1))
@@ -134,16 +143,28 @@ def resolve_batch_size(
     max_bs = max(max_bs, min_bs)
     safety = min(max(safety, 0.1), 0.98)
 
-    probe_loader = DataLoader(
-        train_ds,
-        batch_size=probe_bs,
-        shuffle=False,
-        drop_last=True,
-        num_workers=0,
-        pin_memory=False,
-    )
-
-    x, y = next(iter(probe_loader))
+    if isinstance(train_ds, IterableDataset):
+        probe_loader = DataLoader(
+            train_ds,
+            batch_size=probe_bs,
+            drop_last=True,
+            num_workers=0,
+            pin_memory=False,
+        )
+    else:
+        probe_loader = DataLoader(
+            train_ds,
+            batch_size=probe_bs,
+            shuffle=False,
+            drop_last=True,
+            num_workers=0,
+            pin_memory=False,
+        )
+    try:
+        x, y = next(iter(probe_loader))
+    except StopIteration:
+        fallback = base_bs if base_bs > 0 else min_bs
+        return max(min_bs, min(max_bs, fallback))
 
     device_index = device.index if device.index is not None else torch.cuda.current_device()
     torch.cuda.empty_cache()
@@ -153,40 +174,48 @@ def resolve_batch_size(
     y = y.to(device, non_blocking=True)
     model.train()
 
-    with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-        if model_version == MODEL_VERSION_V1:
-            nll, aux = model.filtered_nll(x, y)
-            loss = (
-                nll
-                + loss_weights["entropy_reg"] * aux["belief_entropy"]
-                + loss_weights["usage_balance"] * aux["usage_kl_to_uniform"]
-                + loss_weights["chunk_bow"] * aux["chunk_bow_loss"]
-                - loss_weights["plan_mi"] * aux["plan_mi"]
-                + loss_weights["chunk_post_kl"] * aux["chunk_post_kl"]
-            )
-        else:
-            nll, aux = model.compute_losses(
-                x,
-                y,
-                planner_mode="normal",
-                commitment=v2_commitment,
-                planner_temperature=v2_plan_temperature,
-                rep_unlikelihood_window=v2_rep_unlikelihood_window,
-            )
-            loss = (
-                nll
-                + loss_weights["v2_usage"] * aux["usage_kl_to_uniform"]
-                + loss_weights["v2_boundary_entropy"] * aux["boundary_entropy"]
-                + loss_weights["v2_future"] * aux["future_contrastive_loss"]
-                - loss_weights["v2_js"] * aux["plan_js_div_loss"]
-                + loss_weights["v2_rep_unlikelihood"] * aux["rep_unlikelihood_loss"]
-            )
-
-    loss.backward()
-    torch.cuda.synchronize(device_index)
-    peak = torch.cuda.max_memory_allocated(device_index)
-    model.zero_grad(set_to_none=True)
-    del x, y
+    try:
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            if model_version == MODEL_VERSION_V1:
+                nll, aux = model.filtered_nll(x, y)
+                loss = (
+                    nll
+                    + loss_weights["entropy_reg"] * aux["belief_entropy"]
+                    + loss_weights["usage_balance"] * aux["usage_kl_to_uniform"]
+                    + loss_weights["chunk_bow"] * aux["chunk_bow_loss"]
+                    - loss_weights["plan_mi"] * aux["plan_mi"]
+                    + loss_weights["chunk_post_kl"] * aux["chunk_post_kl"]
+                )
+            else:
+                nll, aux = model.compute_losses(
+                    x,
+                    y,
+                    planner_mode="normal",
+                    commitment=v2_commitment,
+                    planner_temperature=v2_plan_temperature,
+                    rep_unlikelihood_window=v2_rep_unlikelihood_window,
+                )
+                loss = (
+                    nll
+                    + loss_weights["v2_usage"] * aux["usage_kl_to_uniform"]
+                    + loss_weights["v2_boundary_entropy"] * aux["boundary_entropy"]
+                    + loss_weights["v2_future"] * aux["future_contrastive_loss"]
+                    - loss_weights["v2_js"] * aux["plan_js_div_loss"]
+                    + loss_weights["v2_rep_unlikelihood"] * aux["rep_unlikelihood_loss"]
+                )
+        loss.backward()
+        torch.cuda.synchronize(device_index)
+        peak = torch.cuda.max_memory_allocated(device_index)
+    except RuntimeError as exc:
+        if "out of memory" in str(exc).lower():
+            fallback = max(min_bs, min(max_bs, max(1, base_bs // 2)))
+            torch.cuda.empty_cache()
+            model.zero_grad(set_to_none=True)
+            return fallback
+        raise
+    finally:
+        model.zero_grad(set_to_none=True)
+        del x, y
 
     per_sample = max(int(peak / probe_bs), 1)
     free_bytes, _total_bytes = torch.cuda.mem_get_info(device_index)
@@ -478,6 +507,43 @@ def save_checkpoint(
     torch.save(checkpoint, path)
 
 
+def build_loaders(
+    *,
+    train_ds: Dataset,
+    val_ds: Dataset,
+    batch_size: int,
+    train_cfg: dict[str, Any],
+) -> tuple[DataLoader, DataLoader]:
+    num_workers = int(train_cfg.get("num_workers", 0))
+    pin_memory = bool(train_cfg.get("pin_memory", False))
+    if isinstance(train_ds, IterableDataset):
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            drop_last=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    return train_loader, val_loader
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train APEL-R model.")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config.")
@@ -496,31 +562,60 @@ def main() -> None:
 
     source = data_cfg["source"]
     spec = get_dataset_spec(source)
+    token_cache_enabled = bool(data_cfg.get("token_cache", False))
 
     print(f"Loading dataset source={source} ({spec.path})...")
-    train_text, train_stats = load_corpus_text(
-        source=source,
-        split=data_cfg.get("train_split", spec.train_split),
-        max_examples=int(data_cfg["max_train_examples"]),
-        min_chars=int(data_cfg.get("min_chars", 8)),
-        max_chars=(int(data_cfg["max_train_chars"]) if data_cfg.get("max_train_chars") is not None else None),
-        streaming=data_cfg.get("streaming"),
-        cache_dir=data_cfg.get("cache_dir"),
-    )
-    val_text, val_stats = load_corpus_text(
-        source=source,
-        split=data_cfg.get("val_split", spec.val_split),
-        max_examples=int(data_cfg["max_val_examples"]),
-        min_chars=int(data_cfg.get("min_chars", 8)),
-        max_chars=(int(data_cfg["max_val_chars"]) if data_cfg.get("max_val_chars") is not None else None),
-        streaming=data_cfg.get("streaming"),
-        cache_dir=data_cfg.get("cache_dir"),
-    )
-    print(f"Train stats: {train_stats}")
-    print(f"Val stats:   {val_stats}")
+    train_text = ""
+    val_text = ""
+    train_stats: dict[str, int] = {}
+    val_stats: dict[str, int] = {}
+    if not token_cache_enabled:
+        train_text, train_stats = load_corpus_text(
+            source=source,
+            split=data_cfg.get("train_split", spec.train_split),
+            max_examples=int(data_cfg["max_train_examples"]),
+            min_chars=int(data_cfg.get("min_chars", 8)),
+            max_chars=(int(data_cfg["max_train_chars"]) if data_cfg.get("max_train_chars") is not None else None),
+            streaming=data_cfg.get("streaming"),
+            cache_dir=data_cfg.get("cache_dir"),
+        )
+        val_text, val_stats = load_corpus_text(
+            source=source,
+            split=data_cfg.get("val_split", spec.val_split),
+            max_examples=int(data_cfg["max_val_examples"]),
+            min_chars=int(data_cfg.get("min_chars", 8)),
+            max_chars=(int(data_cfg["max_val_chars"]) if data_cfg.get("max_val_chars") is not None else None),
+            streaming=data_cfg.get("streaming"),
+            cache_dir=data_cfg.get("cache_dir"),
+        )
+        print(f"Train stats: {train_stats}")
+        print(f"Val stats:   {val_stats}")
+    else:
+        print("Token-cache mode enabled: using on-disk tokenized corpora for large-scale training.")
 
     resume_from = train_cfg.get("resume_from")
     resume_ckpt: dict[str, Any] | None = None
+
+    def ensure_tokenizer_seed_text() -> str:
+        nonlocal train_text
+        if train_text:
+            return train_text
+        fit_max_examples = int(data_cfg.get("tokenizer_fit_max_examples", min(int(data_cfg["max_train_examples"]), 50_000)))
+        fit_max_chars_cfg = data_cfg.get("tokenizer_fit_max_chars")
+        fit_max_chars = int(fit_max_chars_cfg) if fit_max_chars_cfg is not None else None
+        fit_text, fit_stats = load_corpus_text(
+            source=source,
+            split=data_cfg.get("tokenizer_fit_split", data_cfg.get("train_split", spec.train_split)),
+            max_examples=fit_max_examples,
+            min_chars=int(data_cfg.get("min_chars", 8)),
+            max_chars=fit_max_chars,
+            streaming=data_cfg.get("tokenizer_fit_streaming", data_cfg.get("streaming")),
+            cache_dir=data_cfg.get("cache_dir"),
+        )
+        train_text = fit_text
+        print(f"Tokenizer fit stats: {fit_stats}")
+        return train_text
+
     if resume_from:
         resume_path = Path(str(resume_from))
         if not resume_path.exists():
@@ -539,12 +634,14 @@ def main() -> None:
             tokenizer.save(tokenizer_path)
             print(f"Tokenizer loaded from resume checkpoint: type={tokenizer_type}, vocab size={tokenizer.vocab_size}")
         else:
-            tokenizer, tokenizer_type, tokenizer_meta = build_tokenizer(tokenizer_cfg, train_text)
+            tokenizer_seed_text = ensure_tokenizer_seed_text()
+            tokenizer, tokenizer_type, tokenizer_meta = build_tokenizer(tokenizer_cfg, tokenizer_seed_text)
             tokenizer_path = out_dir / "tokenizer.json"
             tokenizer.save(tokenizer_path)
             print(f"Tokenizer type: {tokenizer_type}, vocab size: {tokenizer.vocab_size}")
     else:
-        tokenizer, tokenizer_type, tokenizer_meta = build_tokenizer(tokenizer_cfg, train_text)
+        tokenizer_seed_text = ensure_tokenizer_seed_text()
+        tokenizer, tokenizer_type, tokenizer_meta = build_tokenizer(tokenizer_cfg, tokenizer_seed_text)
         tokenizer_path = out_dir / "tokenizer.json"
         tokenizer.save(tokenizer_path)
         print(f"Tokenizer type: {tokenizer_type}, vocab size: {tokenizer.vocab_size}")
@@ -557,13 +654,60 @@ def main() -> None:
                 f"Config model version '{model_version}' does not match resume checkpoint model version '{ckpt_model_version}'."
             )
 
-    train_ids = prepare_tokens(tokenizer, train_text)
-    val_ids = prepare_tokens(tokenizer, val_text)
-
     seq_len = int(train_cfg["seq_len"])
     stride = int(train_cfg.get("stride", seq_len))
-    train_ds = PackedSequenceDataset(train_ids, seq_len=seq_len, stride=stride)
-    val_ds = PackedSequenceDataset(val_ids, seq_len=seq_len, stride=seq_len)
+    if token_cache_enabled:
+        token_cache_dir = Path(str(data_cfg.get("token_cache_dir", out_dir / "token_cache")))
+        token_cache_dir.mkdir(parents=True, exist_ok=True)
+        train_token_path = Path(str(data_cfg.get("train_token_file", token_cache_dir / "train.bin")))
+        val_token_path = Path(str(data_cfg.get("val_token_file", token_cache_dir / "val.bin")))
+        reuse_token_cache = bool(data_cfg.get("reuse_token_cache", True))
+
+        if (not reuse_token_cache) or (not train_token_path.exists()):
+            train_cache_stats = write_tokenized_corpus(
+                source=source,
+                split=data_cfg.get("train_split", spec.train_split),
+                tokenizer=tokenizer,
+                output_path=train_token_path,
+                max_examples=int(data_cfg["max_train_examples"]),
+                max_tokens=(int(data_cfg["max_train_tokens"]) if data_cfg.get("max_train_tokens") is not None else None),
+                min_chars=int(data_cfg.get("min_chars", 8)),
+                max_chars=(int(data_cfg["max_train_chars"]) if data_cfg.get("max_train_chars") is not None else None),
+                streaming=data_cfg.get("streaming"),
+                cache_dir=data_cfg.get("cache_dir"),
+                add_bos=True,
+                add_eos=True,
+            )
+            print(f"Train token cache stats: {train_cache_stats}")
+        else:
+            print(f"Reusing train token cache: {train_token_path}")
+
+        if (not reuse_token_cache) or (not val_token_path.exists()):
+            val_cache_stats = write_tokenized_corpus(
+                source=source,
+                split=data_cfg.get("val_split", spec.val_split),
+                tokenizer=tokenizer,
+                output_path=val_token_path,
+                max_examples=int(data_cfg["max_val_examples"]),
+                max_tokens=(int(data_cfg["max_val_tokens"]) if data_cfg.get("max_val_tokens") is not None else None),
+                min_chars=int(data_cfg.get("min_chars", 8)),
+                max_chars=(int(data_cfg["max_val_chars"]) if data_cfg.get("max_val_chars") is not None else None),
+                streaming=data_cfg.get("streaming"),
+                cache_dir=data_cfg.get("cache_dir"),
+                add_bos=True,
+                add_eos=True,
+            )
+            print(f"Val token cache stats: {val_cache_stats}")
+        else:
+            print(f"Reusing val token cache: {val_token_path}")
+
+        train_ds = PackedMemmapDataset(train_token_path, seq_len=seq_len, stride=stride)
+        val_ds = PackedMemmapDataset(val_token_path, seq_len=seq_len, stride=seq_len)
+    else:
+        train_ids = prepare_tokens(tokenizer, train_text)
+        val_ids = prepare_tokens(tokenizer, val_text)
+        train_ds = PackedSequenceDataset(train_ids, seq_len=seq_len, stride=stride)
+        val_ds = PackedSequenceDataset(val_ids, seq_len=seq_len, stride=seq_len)
 
     model = instantiate_model(model_cfg=model_cfg, vocab_size=tokenizer.vocab_size, model_version=model_version)
 
@@ -655,22 +799,24 @@ def main() -> None:
         v2_rep_unlikelihood_window=v2_rep_unlikelihood_window,
     )
 
-    train_loader = DataLoader(
-        train_ds,
+    train_loader, val_loader = build_loaders(
+        train_ds=train_ds,
+        val_ds=val_ds,
         batch_size=batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=int(train_cfg.get("num_workers", 0)),
-        pin_memory=bool(train_cfg.get("pin_memory", False)),
+        train_cfg=train_cfg,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
-        num_workers=int(train_cfg.get("num_workers", 0)),
-        pin_memory=bool(train_cfg.get("pin_memory", False)),
-    )
+    adaptive_batch_cfg = train_cfg.get("adaptive_batch", {})
+    batch_size_raw = train_cfg.get("batch_size", 1)
+    if isinstance(adaptive_batch_cfg, bool):
+        adaptive_batch_enabled = adaptive_batch_cfg
+        adaptive_batch_cfg = {}
+    elif isinstance(adaptive_batch_cfg, dict):
+        adaptive_batch_enabled = bool(adaptive_batch_cfg.get("enabled", _is_auto_batch_size(batch_size_raw)))
+    else:
+        adaptive_batch_enabled = _is_auto_batch_size(batch_size_raw)
+        adaptive_batch_cfg = {}
+    reprobe_interval_steps = int(adaptive_batch_cfg.get("reprobe_interval_steps", 0))
+    dynamic_reprobe = adaptive_batch_enabled and device.type == "cuda" and reprobe_interval_steps > 0
 
     save_interval = int(train_cfg.get("save_interval", 0))
 
@@ -697,6 +843,7 @@ def main() -> None:
     micro_step = 0
     optimizer.zero_grad(set_to_none=True)
     while global_step < max_steps:
+        reprobe_triggered = False
         for x, y in train_loader:
             if global_step >= max_steps:
                 break
@@ -781,6 +928,32 @@ def main() -> None:
 
             global_step += 1
             progress.update(1)
+
+            if dynamic_reprobe and (global_step % reprobe_interval_steps == 0) and global_step < max_steps:
+                new_batch_size = resolve_batch_size(
+                    train_cfg=train_cfg,
+                    device=device,
+                    model=model,
+                    model_version=model_version,
+                    train_ds=train_ds,
+                    use_amp=use_amp,
+                    amp_dtype=amp_dtype,
+                    loss_weights=loss_weights,
+                    v2_commitment=v2_commitment,
+                    v2_plan_temperature=v2_plan_temperature_start,
+                    v2_rep_unlikelihood_window=v2_rep_unlikelihood_window,
+                )
+                if new_batch_size != batch_size:
+                    batch_size = new_batch_size
+                    train_loader, val_loader = build_loaders(
+                        train_ds=train_ds,
+                        val_ds=val_ds,
+                        batch_size=batch_size,
+                        train_cfg=train_cfg,
+                    )
+                    print(f"\n[adaptive batch] step={global_step} updated batch_size={batch_size}")
+                    reprobe_triggered = True
+                    break
 
             if global_step % log_interval == 0 or global_step == 1:
                 elapsed = time.time() - start_time
@@ -874,6 +1047,8 @@ def main() -> None:
                     global_step=global_step,
                 )
                 print(f"\n[checkpoint step {global_step}] saved to {out_dir / 'checkpoint.pt'}")
+        if reprobe_triggered:
+            continue
 
     progress.close()
 

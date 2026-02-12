@@ -56,18 +56,15 @@ class APELRV2Model(nn.Module):
         )
         self.dropout = nn.Dropout(cfg.dropout)
 
-        # Chunk planner.
         self.planner_init_logits = nn.Parameter(torch.zeros(cfg.num_plan_states))
         self.planner_transition_logits = nn.Parameter(torch.zeros(cfg.num_plan_states, cfg.num_plan_states))
         self.planner_obs_proj = nn.Linear(cfg.hidden_dim, cfg.num_plan_states)
         self.planner_boundary_proj = nn.Linear(cfg.hidden_dim, cfg.num_plan_states)
 
-        # Expert LM heads: one expert per planner state.
         self.expert_heads = nn.ModuleList(
             [nn.Linear(cfg.hidden_dim, cfg.vocab_size) for _ in range(cfg.num_experts)]
         )
 
-        # Plan embeddings and future-chunk objective projections.
         self.plan_state_emb = nn.Embedding(cfg.num_plan_states, cfg.hidden_dim)
         self.future_chunk_proj = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
 
@@ -104,7 +101,6 @@ class APELRV2Model(nn.Module):
         return pi0.unsqueeze(0).expand(batch_size, -1).to(device)
 
     def _chunk_summaries(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # h: [B, L, H] -> summaries [B, C, H], token_chunk_idx [L]
         bsz, seq_len, hdim = h.shape
         num_chunks = math.ceil(seq_len / self.chunk_size)
         chunks: list[torch.Tensor] = []
@@ -112,7 +108,7 @@ class APELRV2Model(nn.Module):
             s = c * self.chunk_size
             e = min(seq_len, s + self.chunk_size)
             chunks.append(h[:, s:e, :].mean(dim=1))
-        chunk_summary = torch.stack(chunks, dim=1)  # [B, C, H]
+        chunk_summary = torch.stack(chunks, dim=1)
         token_chunk_idx = torch.arange(seq_len, device=h.device) // self.chunk_size
         return chunk_summary, token_chunk_idx
 
@@ -144,7 +140,6 @@ class APELRV2Model(nn.Module):
         for c in range(num_chunks):
             if c > 0:
                 prior = belief @ trans
-                # Causal planner update: state for chunk c depends only on previous chunk summary.
                 prev_summary = chunk_summary[:, c - 1, :]
                 ctx_bias = self.cfg.planner_context_scale * self.planner_boundary_proj(prev_summary)
                 obs_bias = self.planner_obs_proj(prev_summary)
@@ -180,7 +175,6 @@ class APELRV2Model(nn.Module):
         target_ids: torch.Tensor,
         window: int,
     ) -> torch.Tensor:
-        # Penalize assigning high probability to recently seen tokens.
         if window <= 0:
             return torch.zeros((), device=mix_log_probs.device)
         probs = mix_log_probs.exp()
@@ -203,7 +197,6 @@ class APELRV2Model(nn.Module):
         return torch.stack(losses).mean()
 
     def _expert_log_probs(self, h: torch.Tensor) -> torch.Tensor:
-        # [B, L, H] -> [B, L, K, V]
         logits_k = torch.stack([head(self.dropout(h)) for head in self.expert_heads], dim=2)
         return F.log_softmax(logits_k, dim=-1)
 
@@ -213,12 +206,10 @@ class APELRV2Model(nn.Module):
         chunk_states: torch.Tensor,
         token_chunk_idx: torch.Tensor,
     ) -> torch.Tensor:
-        # expert_log_probs: [B, L, K, V], chunk_states: [B, C, K], token_chunk_idx: [L]
-        token_states = chunk_states[:, token_chunk_idx, :]  # [B, L, K]
+        token_states = chunk_states[:, token_chunk_idx, :]
         return torch.logsumexp(self._belief_log(token_states).unsqueeze(-1) + expert_log_probs, dim=2)
 
     def _future_contrastive_loss(self, chunk_states: torch.Tensor, chunk_summary: torch.Tensor) -> torch.Tensor:
-        # InfoNCE between current chunk plan vector and future chunk summary vectors.
         bsz, num_chunks, _ = chunk_summary.shape
         if num_chunks <= 1:
             return torch.zeros((), device=chunk_summary.device)
@@ -226,14 +217,14 @@ class APELRV2Model(nn.Module):
         if horizon <= 0:
             return torch.zeros((), device=chunk_summary.device)
 
-        plan_vec = chunk_states @ self.plan_state_emb.weight  # [B, C, H]
+        plan_vec = chunk_states @ self.plan_state_emb.weight
         plan_vec = F.normalize(plan_vec, dim=-1)
-        future_vec = F.normalize(self.future_chunk_proj(chunk_summary), dim=-1)  # [B, C, H]
+        future_vec = F.normalize(self.future_chunk_proj(chunk_summary), dim=-1)
 
         losses: list[torch.Tensor] = []
         for d in range(1, horizon + 1):
-            anchor = plan_vec[:, :-d, :].reshape(-1, plan_vec.shape[-1])  # [N, H]
-            positive = future_vec[:, d:, :].reshape(-1, future_vec.shape[-1])  # [N, H]
+            anchor = plan_vec[:, :-d, :].reshape(-1, plan_vec.shape[-1])
+            positive = future_vec[:, d:, :].reshape(-1, future_vec.shape[-1])
             if anchor.numel() == 0:
                 continue
             logits = anchor @ positive.t()
@@ -245,8 +236,7 @@ class APELRV2Model(nn.Module):
         return torch.stack(losses).mean()
 
     def _pairwise_js_div_loss(self, expert_log_probs: torch.Tensor) -> torch.Tensor:
-        # expert_log_probs: [B, L, K, V]
-        probs = expert_log_probs.exp().reshape(-1, self.num_experts, self.vocab_size)  # [N, K, V]
+        probs = expert_log_probs.exp().reshape(-1, self.num_experts, self.vocab_size)
         logs = expert_log_probs.reshape(-1, self.num_experts, self.vocab_size)
         num_pairs = 0
         js_sum = torch.zeros((), device=expert_log_probs.device)
@@ -295,11 +285,10 @@ class APELRV2Model(nn.Module):
 
         expert_log_probs = self._expert_log_probs(h)
         if self.cfg.token_filtering and planner_mode == "normal":
-            # Within-chunk Bayesian token filtering so planner belief can react to emitted token evidence.
             bsz, seq_len = input_ids.shape
             mix_steps: list[torch.Tensor] = []
             cur_chunk = int(token_chunk_idx[0].item()) if seq_len > 0 else 0
-            belief_t = chunk_states[:, cur_chunk, :]  # [B, K]
+            belief_t = chunk_states[:, cur_chunk, :]
             for t in range(seq_len):
                 c = int(token_chunk_idx[t].item())
                 if c != cur_chunk:
@@ -314,16 +303,15 @@ class APELRV2Model(nn.Module):
                     index=tgt.view(-1, 1, 1).expand(-1, self.num_plan_states, 1),
                 ).squeeze(-1)
                 belief_t = F.softmax(self._belief_log(belief_t) + obs_logp, dim=-1)
-            mix_log_probs = torch.stack(mix_steps, dim=1)  # [B, L, V]
+            mix_log_probs = torch.stack(mix_steps, dim=1)
         else:
-            mix_log_probs = self._mixture_log_probs(expert_log_probs, chunk_states, token_chunk_idx)  # [B, L, V]
+            mix_log_probs = self._mixture_log_probs(expert_log_probs, chunk_states, token_chunk_idx)
         tok_nll = F.nll_loss(
             mix_log_probs.reshape(-1, self.vocab_size),
             target_ids.reshape(-1),
             reduction="mean",
         )
 
-        # Planner metrics/losses.
         boundary_entropy = -(chunk_post * (chunk_post + self.eps).log()).sum(dim=-1).mean()
         usage = chunk_states.mean(dim=(0, 1))
         uniform = torch.full_like(usage, 1.0 / self.num_plan_states)
@@ -338,7 +326,7 @@ class APELRV2Model(nn.Module):
             window=rep_unlikelihood_window,
         )
 
-        state_idx = torch.argmax(chunk_states, dim=-1)  # [B, C]
+        state_idx = torch.argmax(chunk_states, dim=-1)
         if state_idx.shape[1] > 1:
             state_persistence = (state_idx[:, 1:] == state_idx[:, :-1]).float().mean()
         else:
@@ -362,13 +350,10 @@ class APELRV2Model(nn.Module):
         input_ids: torch.Tensor,
         target_ids: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        # Base
         base_nll, aux = self.compute_losses(input_ids, target_ids, planner_mode="normal", commitment="soft")
-        # Planner masked
         masked_nll, _ = self.compute_losses(input_ids, target_ids, planner_mode="uniform_mask", commitment="soft")
         planner_mask_delta = masked_nll - base_nll
 
-        # Forced-state output divergence.
         bsz, seq_len = input_ids.shape
         x = self.token_emb(input_ids)
         h, _ = self.backbone(x)
@@ -455,7 +440,6 @@ class APELRV2Model(nn.Module):
                     banned.add(int(ngram[-1]))
             return banned
 
-        # Prime hidden state with prompt.
         for tok in prompt_ids:
             tok_t = torch.tensor([[tok]], device=device, dtype=torch.long)
             out, hidden = self.backbone(self.token_emb(tok_t), hidden)
@@ -467,8 +451,8 @@ class APELRV2Model(nn.Module):
 
         for _ in range(max_new_tokens):
             state = hidden[-1, :, :] if hidden is not None else torch.zeros((1, self.cfg.hidden_dim), device=device)
-            expert_logits = torch.stack([head(state) for head in self.expert_heads], dim=1)  # [1, K, V]
-            expert_log_probs = F.log_softmax(expert_logits, dim=-1).squeeze(0)  # [K, V]
+            expert_logits = torch.stack([head(state) for head in self.expert_heads], dim=1)
+            expert_log_probs = F.log_softmax(expert_logits, dim=-1).squeeze(0)
 
             if force_state is not None:
                 gate = torch.zeros((self.num_plan_states,), device=device)
@@ -516,9 +500,8 @@ class APELRV2Model(nn.Module):
             next_id = int(torch.multinomial(probs, 1).item())
 
             seq.append(next_id)
-            # Token-level posterior update over planner state from observed emitted token.
             if not freeze_planner and force_state is None:
-                obs_logp = expert_log_probs[:, next_id].unsqueeze(0)  # [1, K]
+                obs_logp = expert_log_probs[:, next_id].unsqueeze(0)
                 belief = F.softmax(self._belief_log(belief) + obs_logp, dim=-1)
             tok_t = torch.tensor([[next_id]], device=device, dtype=torch.long)
             out, hidden = self.backbone(self.token_emb(tok_t), hidden)

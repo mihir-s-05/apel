@@ -63,6 +63,8 @@ uv pip install --python .venv\Scripts\python.exe torch --index-url https://downl
 uv pip install --python .venv\Scripts\python.exe -e .
 ```
 
+For A100/H100, use the CUDA build and set `train.precision: bf16` in your config.
+
 CPU-only install:
 
 ```powershell
@@ -96,24 +98,8 @@ Useful configs:
    Uses stronger planner self-transition bias initialization.
 4. `configs/tinystories_small.yaml`:
    Intermediate training run.
-5. `configs/tinystories_bpe_smoke.yaml`:
-   BPE tokenizer run with identifiability loss enabled.
-6. `configs/tinystories_bpe_ident_iter.yaml`:
-   Longer BPE + plan-identifiability iteration.
-7. `configs/tinystories_bpe_ident_cpk_scale.yaml`:
-   Larger BPE run adding chunk-posterior KL alignment for stronger plan identifiability.
-8. `configs/wikitext2_bpe_ident_cpk.yaml`:
-   Additional-source run for cross-domain validation with the same identifiability stack.
-9. `configs/cc_news_bpe_ident_cpk.yaml`:
-   News-domain run to test whether planner states remain identifiable off story-style corpora.
-10. `configs/tinystories_bpe_ident_resume_sharp.yaml`:
-   Continuation run from a saved checkpoint with sharper identifiability regularization.
-11. `configs/wikitext2_bpe_ident_cpk_smoke.yaml`:
-   Short cross-domain smoke run to validate WikiText-2 training dynamics.
-12. `configs/v2_tinystories_cuda_fast.yaml`:
-   V2 planner-required CUDA fast-iteration config.
-13. `configs/v2_wikitext2_cuda_fast.yaml`:
-   V2 cross-domain CUDA fast-iteration config.
+
+Add one-off experiment YAMLs under `configs/local/` (ignored by git).
 
 Important knobs:
 
@@ -135,6 +121,44 @@ Important knobs:
 16. `train.precision`: `fp32`, `fp16`, or `bf16` (AMP used automatically on CUDA).
 17. `train.grad_accum_steps`: gradient accumulation factor for VRAM-constrained training.
 18. `train.loss_weights.*` (V2): planner-required objectives (`future_contrastive`, `plan_js_div`, `boundary_entropy`, `usage_balance`).
+19. `data.token_cache`: if `true`, builds/uses on-disk tokenized corpora (`.bin`) instead of holding full text in RAM.
+20. `data.token_cache_dir`: output directory for token cache files (default under `train.out_dir`).
+21. `data.max_train_tokens` / `data.max_val_tokens`: hard token caps for cache construction.
+22. `data.tokenizer_fit_max_examples` / `data.tokenizer_fit_max_chars`: bounded sample used to fit tokenizer in token-cache mode.
+23. `data.reuse_token_cache`: reuse previously built `.bin` files instead of rebuilding.
+24. `train.adaptive_batch.enabled`: enable VRAM-based auto batch probe.
+25. `train.adaptive_batch.probe_batch_size`: micro-batch used for memory probing.
+26. `train.adaptive_batch.reprobe_interval_steps`: periodically re-probe and update batch size mid-run.
+
+## Large-Scale Training
+
+For GPT-2-scale corpora, use token-cache mode so training reads pretokenized memmap files:
+
+```yaml
+data:
+  source: fineweb_edu
+  streaming: true
+  token_cache: true
+  token_cache_dir: runs/my_run/token_cache
+  reuse_token_cache: true
+  max_train_examples: 2000000
+  max_val_examples: 50000
+  max_train_tokens: 500000000
+  max_val_tokens: 20000000
+  tokenizer_fit_max_examples: 100000
+  tokenizer_fit_max_chars: 20000000
+
+train:
+  precision: bf16
+  batch_size: auto
+  adaptive_batch:
+    enabled: true
+    probe_batch_size: 2
+    min_batch_size: 1
+    max_batch_size: 64
+    safety_factor: 0.9
+    reprobe_interval_steps: 500
+```
 
 ## Sampling Options
 

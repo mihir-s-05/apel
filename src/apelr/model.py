@@ -77,7 +77,6 @@ class APELRModel(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
     def transition_matrix(self) -> torch.Tensor:
-        # Row-stochastic matrix P[i, j] = p(z_{c+1}=j | z_c=i)
         return F.softmax(self.planner_transition_logits, dim=-1)
 
     def initial_belief(self, batch_size: int, device: torch.device) -> torch.Tensor:
@@ -88,7 +87,6 @@ class APELRModel(nn.Module):
         return (belief + self.eps).log()
 
     def _apply_posterior_update(self, belief: torch.Tensor, token_logp_by_plan: torch.Tensor) -> torch.Tensor:
-        # token_logp_by_plan: [B, K]
         return F.softmax(self._belief_log(belief) + token_logp_by_plan, dim=-1)
 
     def _apply_chunk_boundary_update(
@@ -103,23 +101,20 @@ class APELRModel(nn.Module):
         return F.softmax(self._belief_log(prior) + context_logit, dim=-1)
 
     def _project_plan_states(self) -> torch.Tensor:
-        return self.plan_proj(self.plan_emb.weight)  # [K, D]
+        return self.plan_proj(self.plan_emb.weight)
 
     def _logp_per_plan(
         self,
         input_ids: torch.Tensor,
         target_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Returns:
-        # - log p(y_t | y_<t, z) for all z with shape [B, L, K]
-        # - planner context logits from token history states with shape [B, L, K]
         x = self.token_emb(input_ids)
         h, _ = self.backbone(x)
-        ctx_logits = self.cfg.planner_context_scale * self.planner_ctx_proj(h)  # [B, L, K]
-        s = self.state_proj(h)  # [B, L, D]
-        plan_repr = self._project_plan_states()  # [K, D]
-        joint = torch.tanh(s.unsqueeze(2) + plan_repr.unsqueeze(0).unsqueeze(0))  # [B, L, K, D]
-        logits = self.out_proj(self.dropout(joint)) + self.plan_vocab_bias.unsqueeze(0).unsqueeze(0)  # [B, L, K, V]
+        ctx_logits = self.cfg.planner_context_scale * self.planner_ctx_proj(h)
+        s = self.state_proj(h)
+        plan_repr = self._project_plan_states()
+        joint = torch.tanh(s.unsqueeze(2) + plan_repr.unsqueeze(0).unsqueeze(0))
+        logits = self.out_proj(self.dropout(joint)) + self.plan_vocab_bias.unsqueeze(0).unsqueeze(0)
         log_probs = F.log_softmax(logits, dim=-1)
         idx = target_ids.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.num_plan_states, 1)
         token_logp = torch.gather(log_probs, dim=-1, index=idx).squeeze(-1)
@@ -130,13 +125,12 @@ class APELRModel(nn.Module):
         input_ids: torch.Tensor,
         target_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        # Exact filtered mixture over discrete planner states.
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
         logp_per_plan, ctx_logits, log_probs, h = self._logp_per_plan(input_ids, target_ids)
 
-        P = self.transition_matrix()  # [K, K]
-        belief = self.initial_belief(batch_size, device)  # [B, K]
+        P = self.transition_matrix()
+        belief = self.initial_belief(batch_size, device)
 
         total_nll = torch.zeros((), device=device)
         belief_entropy_sum = torch.zeros((), device=device)
@@ -152,17 +146,17 @@ class APELRModel(nn.Module):
 
             if t % self.chunk_size == 0:
                 t_end = min(seq_len, t + self.chunk_size)
-                chunk_targets = target_ids[:, t:t_end]  # [B, chunk_len]
-                chunk_hist = F.one_hot(chunk_targets, num_classes=self.vocab_size).float().mean(dim=1)  # [B, V]
-                chunk_log_probs_k = log_probs[:, t:t_end, :, :]  # [B, chunk_len, K, V]
-                chunk_probs_k = chunk_log_probs_k.exp().mean(dim=1)  # [B, K, V]
+                chunk_targets = target_ids[:, t:t_end]
+                chunk_hist = F.one_hot(chunk_targets, num_classes=self.vocab_size).float().mean(dim=1)
+                chunk_log_probs_k = log_probs[:, t:t_end, :, :]
+                chunk_probs_k = chunk_log_probs_k.exp().mean(dim=1)
                 chunk_log_probs_k_mean = (chunk_probs_k + self.eps).log()
                 mix_log_probs = torch.logsumexp(self._belief_log(belief).unsqueeze(-1) + chunk_log_probs_k_mean, dim=1)
                 chunk_ce = -(chunk_hist * mix_log_probs).sum(dim=-1).mean()
                 chunk_bow_sum = chunk_bow_sum + chunk_ce
 
-                chunk_summary = h[:, t:t_end, :].mean(dim=1)  # [B, H]
-                q = F.softmax(self.chunk_post_proj(chunk_summary), dim=-1)  # [B, K]
+                chunk_summary = h[:, t:t_end, :].mean(dim=1)
+                q = F.softmax(self.chunk_post_proj(chunk_summary), dim=-1)
                 q_log = (q + self.eps).log()
 
                 chunk_post = belief
@@ -177,24 +171,24 @@ class APELRModel(nn.Module):
                 chunk_post_kl_sum = chunk_post_kl_sum + chunk_post_kl.mean()
                 chunk_count += 1
 
-            logp_z = logp_per_plan[:, t, :]  # [B, K]
+            logp_z = logp_per_plan[:, t, :]
             log_b = self._belief_log(belief)
-            log_probs_t = log_probs[:, t, :, :]  # [B, K, V]
+            log_probs_t = log_probs[:, t, :, :]
             probs_t = log_probs_t.exp()
 
-            mix_log_probs_t = torch.logsumexp(log_b.unsqueeze(-1) + log_probs_t, dim=1)  # [B, V]
+            mix_log_probs_t = torch.logsumexp(log_b.unsqueeze(-1) + log_probs_t, dim=1)
             mix_probs_t = mix_log_probs_t.exp()
-            h_mix = -(mix_probs_t * mix_log_probs_t).sum(dim=-1)  # [B]
-            h_cond_k = -(probs_t * log_probs_t).sum(dim=-1)  # [B, K]
-            h_cond = (belief * h_cond_k).sum(dim=-1)  # [B]
+            h_mix = -(mix_probs_t * mix_log_probs_t).sum(dim=-1)
+            h_cond_k = -(probs_t * log_probs_t).sum(dim=-1)
+            h_cond = (belief * h_cond_k).sum(dim=-1)
             plan_mi_sum = plan_mi_sum + (h_mix - h_cond).mean()
 
-            log_mix = torch.logsumexp(log_b + logp_z, dim=-1)  # [B]
+            log_mix = torch.logsumexp(log_b + logp_z, dim=-1)
             total_nll = total_nll - log_mix.sum()
 
             belief = self._apply_posterior_update(belief, logp_z)
 
-            entropy = -(belief * (belief + self.eps).log()).sum(dim=-1)  # [B]
+            entropy = -(belief * (belief + self.eps).log()).sum(dim=-1)
             belief_entropy_sum = belief_entropy_sum + entropy.mean()
             belief_mass_sum = belief_mass_sum + belief.sum(dim=0)
 
@@ -257,18 +251,17 @@ class APELRModel(nn.Module):
         plan_repr = self._project_plan_states()
         inv_temp = 1.0 / max(temperature, 1e-6)
 
-        # Update belief with observed prompt transitions (except first token).
         for idx in range(1, len(prompt_ids)):
             t = idx - 1
             prev_tok = torch.tensor([[prompt_ids[idx - 1]]], device=device, dtype=torch.long)
             emb = self.token_emb(prev_tok)
             out, hidden = self.backbone(emb, hidden)
-            state = out[:, -1, :]  # [1, H]
+            state = out[:, -1, :]
             if t > 0 and t % self.chunk_size == 0:
                 ctx_bias = self.cfg.planner_context_scale * self.planner_ctx_proj(state)
                 belief = self._apply_chunk_boundary_update(belief, P, ctx_bias)
-            logits_k = self._state_to_plan_logits(state, plan_repr=plan_repr)  # [1, K, V]
-            logp_k = F.log_softmax(logits_k, dim=-1)[:, :, prompt_ids[idx]]  # [1, K]
+            logits_k = self._state_to_plan_logits(state, plan_repr=plan_repr)
+            logp_k = F.log_softmax(logits_k, dim=-1)[:, :, prompt_ids[idx]]
             belief = self._apply_posterior_update(belief, logp_k)
 
         lookahead_trace: list[list[float]] = []
@@ -287,7 +280,6 @@ class APELRModel(nn.Module):
                     banned.add(int(ngram[-1]))
             return banned
 
-        # Build state for next-token prediction from the last observed token.
         last_tok = torch.tensor([[prompt_ids[-1]]], device=device, dtype=torch.long)
         out, hidden = self.backbone(self.token_emb(last_tok), hidden)
         state_next = out[:, -1, :]
@@ -297,15 +289,15 @@ class APELRModel(nn.Module):
                 ctx_bias = self.cfg.planner_context_scale * self.planner_ctx_proj(state_next)
                 belief = self._apply_chunk_boundary_update(belief, P, ctx_bias)
 
-            logits_k = self._state_to_plan_logits(state_next, plan_repr=plan_repr)  # [1, K, V]
-            base_log_probs = F.log_softmax(logits_k, dim=-1).squeeze(0)  # [K, V]
+            logits_k = self._state_to_plan_logits(state_next, plan_repr=plan_repr)
+            base_log_probs = F.log_softmax(logits_k, dim=-1).squeeze(0)
             sample_log_probs = (
                 F.log_softmax(logits_k * inv_temp, dim=-1).squeeze(0)
                 if temperature != 1.0
                 else base_log_probs
             )
-            log_b = self._belief_log(belief.squeeze(0)).unsqueeze(-1)  # [K, 1]
-            mix_log_probs = torch.logsumexp(log_b + sample_log_probs, dim=0)  # [V]
+            log_b = self._belief_log(belief.squeeze(0)).unsqueeze(-1)
+            mix_log_probs = torch.logsumexp(log_b + sample_log_probs, dim=0)
             if repetition_penalty > 1.0:
                 seen = torch.tensor(sorted(set(seq)), device=device, dtype=torch.long)
                 mix_log_probs = mix_log_probs.clone()
@@ -347,7 +339,6 @@ class APELRModel(nn.Module):
 
             if lookahead_steps > 0:
                 future = self.planner_lookahead(belief, lookahead_steps, transition=P)
-                # Record first lookahead state for debugging.
                 lookahead_trace.append(future[0].squeeze(0).detach().cpu().tolist())
 
             step_tok = torch.tensor([[next_id]], device=device, dtype=torch.long)
@@ -365,8 +356,7 @@ class APELRModel(nn.Module):
         *,
         plan_repr: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # state: [B, H] -> logits [B, K, V]
-        s = self.state_proj(state)  # [B, D]
+        s = self.state_proj(state)
         p = self._project_plan_states() if plan_repr is None else plan_repr
-        joint = torch.tanh(s.unsqueeze(1) + p.unsqueeze(0))  # [B, K, D]
+        joint = torch.tanh(s.unsqueeze(1) + p.unsqueeze(0))
         return self.out_proj(self.dropout(joint)) + self.plan_vocab_bias.unsqueeze(0)

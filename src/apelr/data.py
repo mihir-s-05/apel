@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import itertools
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+import numpy as np
 import torch
 from datasets import load_dataset
 from torch.utils.data import Dataset
@@ -165,6 +167,133 @@ def load_corpus_text(
         "streaming": int(use_streaming),
     }
     return corpus, stats
+
+
+def iter_corpus_text(
+    *,
+    source: str,
+    split: str,
+    max_examples: int,
+    min_chars: int = 8,
+    max_chars: int | None = None,
+    streaming: bool | None = None,
+    cache_dir: str | None = None,
+) -> Iterable[str]:
+    spec = get_dataset_spec(source)
+    rows, _ = _iter_rows(
+        source=source,
+        split=split,
+        max_examples=max_examples,
+        streaming=streaming,
+        cache_dir=cache_dir,
+    )
+    total_chars = 0
+    for row in rows:
+        text = str(row.get(spec.text_field, "")).strip()
+        if len(text) < min_chars:
+            continue
+        add_len = len(text) + (2 if total_chars > 0 else 0)
+        if max_chars is not None and max_chars > 0 and (total_chars + add_len) > max_chars:
+            break
+        total_chars += add_len
+        yield text
+
+
+def write_tokenized_corpus(
+    *,
+    source: str,
+    split: str,
+    tokenizer: Any,
+    output_path: str | Path,
+    max_examples: int,
+    max_tokens: int | None = None,
+    min_chars: int = 8,
+    max_chars: int | None = None,
+    streaming: bool | None = None,
+    cache_dir: str | None = None,
+    add_bos: bool = True,
+    add_eos: bool = True,
+    append_eos_between_docs: bool = True,
+) -> dict[str, int]:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    token_count = 0
+    row_count = 0
+    with output_path.open("wb") as f:
+        if add_bos:
+            bos = np.asarray([int(tokenizer.bos_id)], dtype=np.uint32)
+            bos.tofile(f)
+            token_count += 1
+        for text in iter_corpus_text(
+            source=source,
+            split=split,
+            max_examples=max_examples,
+            min_chars=min_chars,
+            max_chars=max_chars,
+            streaming=streaming,
+            cache_dir=cache_dir,
+        ):
+            ids = tokenizer.encode(text, add_bos=False, add_eos=add_eos)
+            if append_eos_between_docs and add_eos is False:
+                ids.append(int(tokenizer.eos_id))
+            if not ids:
+                continue
+            if max_tokens is not None and max_tokens > 0 and token_count >= max_tokens:
+                break
+            if max_tokens is not None and max_tokens > 0:
+                remaining = max_tokens - token_count
+                if remaining <= 0:
+                    break
+                if len(ids) > remaining:
+                    ids = ids[:remaining]
+            arr = np.asarray(ids, dtype=np.uint32)
+            arr.tofile(f)
+            token_count += int(arr.size)
+            row_count += 1
+            if max_tokens is not None and max_tokens > 0 and token_count >= max_tokens:
+                break
+    return {
+        "num_rows_kept": row_count,
+        "num_tokens": token_count,
+        "path_bytes": int(output_path.stat().st_size) if output_path.exists() else 0,
+    }
+
+
+class PackedMemmapDataset(Dataset):
+    def __init__(
+        self,
+        token_path: str | Path,
+        seq_len: int,
+        stride: int | None = None,
+    ) -> None:
+        if seq_len < 2:
+            raise ValueError("seq_len must be >= 2")
+        self.token_path = Path(token_path)
+        if not self.token_path.exists():
+            raise FileNotFoundError(f"token file not found: {self.token_path}")
+        self.tokens = np.memmap(self.token_path, mode="r", dtype=np.uint32)
+        if self.tokens.size <= seq_len:
+            raise ValueError("token file shorter than seq_len")
+        self.seq_len = int(seq_len)
+        self.stride = int(stride or seq_len)
+        if self.stride <= 0:
+            raise ValueError("stride must be > 0")
+        max_start = int(self.tokens.size) - (self.seq_len + 1)
+        self.num_examples = (max_start // self.stride) + 1
+
+    def __len__(self) -> int:
+        return int(self.num_examples)
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if index < 0 or index >= self.num_examples:
+            raise IndexError(index)
+        s = int(index) * self.stride
+        e = s + self.seq_len + 1
+        block_np = np.asarray(self.tokens[s:e], dtype=np.int64)
+        block = torch.from_numpy(block_np)
+        x = block[:-1]
+        y = block[1:]
+        return x, y
 
 
 class PackedSequenceDataset(Dataset):
