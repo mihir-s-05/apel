@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 import torch.nn as nn
@@ -46,6 +47,7 @@ class APELRModel(nn.Module):
         self.out_proj = nn.Linear(cfg.fusion_dim, cfg.vocab_size)
         self.plan_vocab_bias = nn.Parameter(torch.zeros(cfg.num_plan_states, cfg.vocab_size))
         self.planner_ctx_proj = nn.Linear(cfg.hidden_dim, cfg.num_plan_states)
+        self.chunk_post_proj = nn.Linear(cfg.hidden_dim, cfg.num_plan_states)
 
         self.planner_init_logits = nn.Parameter(torch.zeros(cfg.num_plan_states))
         self.planner_transition_logits = nn.Parameter(torch.zeros(cfg.num_plan_states, cfg.num_plan_states))
@@ -63,6 +65,8 @@ class APELRModel(nn.Module):
         nn.init.zeros_(self.plan_vocab_bias)
         nn.init.xavier_uniform_(self.planner_ctx_proj.weight)
         nn.init.zeros_(self.planner_ctx_proj.bias)
+        nn.init.xavier_uniform_(self.chunk_post_proj.weight)
+        nn.init.zeros_(self.chunk_post_proj.bias)
         nn.init.zeros_(self.planner_init_logits)
         nn.init.zeros_(self.planner_transition_logits)
         with torch.no_grad():
@@ -101,7 +105,11 @@ class APELRModel(nn.Module):
     def _project_plan_states(self) -> torch.Tensor:
         return self.plan_proj(self.plan_emb.weight)  # [K, D]
 
-    def _logp_per_plan(self, input_ids: torch.Tensor, target_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _logp_per_plan(
+        self,
+        input_ids: torch.Tensor,
+        target_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Returns:
         # - log p(y_t | y_<t, z) for all z with shape [B, L, K]
         # - planner context logits from token history states with shape [B, L, K]
@@ -115,7 +123,7 @@ class APELRModel(nn.Module):
         log_probs = F.log_softmax(logits, dim=-1)
         idx = target_ids.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.num_plan_states, 1)
         token_logp = torch.gather(log_probs, dim=-1, index=idx).squeeze(-1)
-        return token_logp, ctx_logits
+        return token_logp, ctx_logits, log_probs, h
 
     def filtered_nll(
         self,
@@ -125,7 +133,7 @@ class APELRModel(nn.Module):
         # Exact filtered mixture over discrete planner states.
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
-        logp_per_plan, ctx_logits = self._logp_per_plan(input_ids, target_ids)  # [B, L, K], [B, L, K]
+        logp_per_plan, ctx_logits, log_probs, h = self._logp_per_plan(input_ids, target_ids)
 
         P = self.transition_matrix()  # [K, K]
         belief = self.initial_belief(batch_size, device)  # [B, K]
@@ -133,13 +141,53 @@ class APELRModel(nn.Module):
         total_nll = torch.zeros((), device=device)
         belief_entropy_sum = torch.zeros((), device=device)
         belief_mass_sum = torch.zeros(self.num_plan_states, device=device)
+        chunk_bow_sum = torch.zeros((), device=device)
+        plan_mi_sum = torch.zeros((), device=device)
+        chunk_post_kl_sum = torch.zeros((), device=device)
+        chunk_count = 0
 
         for t in range(seq_len):
             if t > 0 and t % self.chunk_size == 0:
                 belief = self._apply_chunk_boundary_update(belief, P, ctx_logits[:, t, :])
 
+            if t % self.chunk_size == 0:
+                t_end = min(seq_len, t + self.chunk_size)
+                chunk_targets = target_ids[:, t:t_end]  # [B, chunk_len]
+                chunk_hist = F.one_hot(chunk_targets, num_classes=self.vocab_size).float().mean(dim=1)  # [B, V]
+                chunk_log_probs_k = log_probs[:, t:t_end, :, :]  # [B, chunk_len, K, V]
+                chunk_probs_k = chunk_log_probs_k.exp().mean(dim=1)  # [B, K, V]
+                chunk_log_probs_k_mean = (chunk_probs_k + self.eps).log()
+                mix_log_probs = torch.logsumexp(self._belief_log(belief).unsqueeze(-1) + chunk_log_probs_k_mean, dim=1)
+                chunk_ce = -(chunk_hist * mix_log_probs).sum(dim=-1).mean()
+                chunk_bow_sum = chunk_bow_sum + chunk_ce
+
+                chunk_summary = h[:, t:t_end, :].mean(dim=1)  # [B, H]
+                q = F.softmax(self.chunk_post_proj(chunk_summary), dim=-1)  # [B, K]
+                q_log = (q + self.eps).log()
+
+                chunk_post = belief
+                for u in range(t, t_end):
+                    chunk_post = self._apply_posterior_update(chunk_post, logp_per_plan[:, u, :])
+                p = chunk_post
+                p_log = (p + self.eps).log()
+
+                kl_qp = torch.sum(q * (q_log - p_log), dim=-1)
+                kl_pq = torch.sum(p * (p_log - q_log), dim=-1)
+                chunk_post_kl = 0.5 * (kl_qp + kl_pq)
+                chunk_post_kl_sum = chunk_post_kl_sum + chunk_post_kl.mean()
+                chunk_count += 1
+
             logp_z = logp_per_plan[:, t, :]  # [B, K]
             log_b = self._belief_log(belief)
+            log_probs_t = log_probs[:, t, :, :]  # [B, K, V]
+            probs_t = log_probs_t.exp()
+
+            mix_log_probs_t = torch.logsumexp(log_b.unsqueeze(-1) + log_probs_t, dim=1)  # [B, V]
+            mix_probs_t = mix_log_probs_t.exp()
+            h_mix = -(mix_probs_t * mix_log_probs_t).sum(dim=-1)  # [B]
+            h_cond_k = -(probs_t * log_probs_t).sum(dim=-1)  # [B, K]
+            h_cond = (belief * h_cond_k).sum(dim=-1)  # [B]
+            plan_mi_sum = plan_mi_sum + (h_mix - h_cond).mean()
 
             log_mix = torch.logsumexp(log_b + logp_z, dim=-1)  # [B]
             total_nll = total_nll - log_mix.sum()
@@ -155,10 +203,16 @@ class APELRModel(nn.Module):
         mean_usage = belief_mass_sum / (batch_size * seq_len)
         uniform = torch.full_like(mean_usage, fill_value=1.0 / self.num_plan_states)
         usage_kl = torch.sum(mean_usage * ((mean_usage + self.eps).log() - uniform.log()))
+        chunk_bow_loss = chunk_bow_sum / max(chunk_count, 1)
+        plan_mi = plan_mi_sum / seq_len
+        chunk_post_kl_loss = chunk_post_kl_sum / max(chunk_count, 1)
 
         aux = {
             "belief_entropy": mean_entropy,
             "usage_kl_to_uniform": usage_kl,
+            "chunk_bow_loss": chunk_bow_loss,
+            "plan_mi": plan_mi,
+            "chunk_post_kl": chunk_post_kl_loss,
         }
         return nll, aux
 
@@ -184,8 +238,11 @@ class APELRModel(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: int | None = None,
+        top_p: float = 1.0,
         eos_id: int | None = None,
         lookahead_steps: int = 0,
+        repetition_penalty: float = 1.0,
+        no_repeat_ngram_size: int = 0,
     ) -> tuple[list[int], list[list[float]]]:
         self.eval()
         device = next(self.parameters()).device
@@ -217,6 +274,19 @@ class APELRModel(nn.Module):
         lookahead_trace: list[list[float]] = []
         token_pos = len(prompt_ids) - 1
 
+        def banned_tokens_for_no_repeat_ngram(cur_seq: list[int], n: int) -> set[int]:
+            if n <= 1:
+                return set()
+            if len(cur_seq) < n - 1:
+                return set()
+            prefix = tuple(cur_seq[-(n - 1) :])
+            banned: set[int] = set()
+            for i in range(0, len(cur_seq) - n + 1):
+                ngram = tuple(cur_seq[i : i + n])
+                if ngram[:-1] == prefix:
+                    banned.add(int(ngram[-1]))
+            return banned
+
         # Build state for next-token prediction from the last observed token.
         last_tok = torch.tensor([[prompt_ids[-1]]], device=device, dtype=torch.long)
         out, hidden = self.backbone(self.token_emb(last_tok), hidden)
@@ -236,15 +306,39 @@ class APELRModel(nn.Module):
             )
             log_b = self._belief_log(belief.squeeze(0)).unsqueeze(-1)  # [K, 1]
             mix_log_probs = torch.logsumexp(log_b + sample_log_probs, dim=0)  # [V]
+            if repetition_penalty > 1.0:
+                seen = torch.tensor(sorted(set(seq)), device=device, dtype=torch.long)
+                mix_log_probs = mix_log_probs.clone()
+                mix_log_probs[seen] = mix_log_probs[seen] - math.log(repetition_penalty)
+
+            probs = F.softmax(mix_log_probs, dim=-1)
+            if no_repeat_ngram_size > 0:
+                banned = banned_tokens_for_no_repeat_ngram(seq, int(no_repeat_ngram_size))
+                if banned:
+                    banned_idx = torch.tensor(sorted(banned), device=device, dtype=torch.long)
+                    probs = probs.clone()
+                    probs[banned_idx] = 0.0
 
             if top_k is not None and top_k > 0 and top_k < mix_log_probs.numel():
-                top_vals, top_idx = torch.topk(mix_log_probs, k=top_k)
-                probs = F.softmax(top_vals, dim=-1)
-                sample_local = torch.multinomial(probs, num_samples=1).item()
-                next_id = int(top_idx[sample_local].item())
-            else:
+                top_vals, top_idx = torch.topk(probs, k=top_k)
+                probs = torch.zeros_like(probs).scatter(0, top_idx, top_vals)
+
+            if top_p < 1.0:
+                sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+                cum = torch.cumsum(sorted_probs, dim=0)
+                keep = cum <= top_p
+                if keep.numel() > 0:
+                    keep[0] = True
+                filtered = torch.zeros_like(probs)
+                filtered[sorted_idx[keep]] = probs[sorted_idx[keep]]
+                probs = filtered
+
+            probs_sum = probs.sum()
+            if probs_sum <= 0:
                 probs = F.softmax(mix_log_probs, dim=-1)
-                next_id = int(torch.multinomial(probs, num_samples=1).item())
+            else:
+                probs = probs / probs_sum
+            next_id = int(torch.multinomial(probs, num_samples=1).item())
 
             seq.append(next_id)
 

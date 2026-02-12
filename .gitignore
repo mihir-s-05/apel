@@ -48,7 +48,11 @@ datasets/
 # Logs
 *.log
 
+# Local experimental configs
+configs/local/
+configs/*_scratch.yaml
+configs/*_tmp.yaml
+
 # Markdown docs (keep README tracked)
 *.md
-!README.md
 !training_data_sources.md

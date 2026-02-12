@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 import torch
 from datasets import load_dataset
@@ -36,8 +36,24 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         text_field="text",
         default_streaming=False,
     ),
+    "wikitext2": DatasetSpec(
+        path="Salesforce/wikitext",
+        name="wikitext-2-raw-v1",
+        train_split="train",
+        val_split="validation",
+        text_field="text",
+        default_streaming=False,
+    ),
     "fineweb_edu": DatasetSpec(
         path="HuggingFaceFW/fineweb-edu",
+        name="sample-10BT",
+        train_split="train",
+        val_split="train",
+        text_field="text",
+        default_streaming=True,
+    ),
+    "fineweb": DatasetSpec(
+        path="HuggingFaceFW/fineweb",
         name="sample-10BT",
         train_split="train",
         val_split="train",
@@ -51,6 +67,22 @@ DATASET_SPECS: dict[str, DatasetSpec] = {
         val_split="validation",
         text_field="text",
         default_streaming=True,
+    ),
+    "wiki40b_en": DatasetSpec(
+        path="google/wiki40b",
+        name="en",
+        train_split="train",
+        val_split="validation",
+        text_field="text",
+        default_streaming=True,
+    ),
+    "cc_news": DatasetSpec(
+        path="vblagoje/cc_news",
+        name=None,
+        train_split="train",
+        val_split="train",
+        text_field="text",
+        default_streaming=False,
     ),
 }
 
@@ -72,11 +104,11 @@ def _iter_rows(
     max_examples: int,
     streaming: bool | None = None,
     cache_dir: str | None = None,
-) -> tuple[list[dict[str, Any]], bool]:
+) -> tuple[Iterable[dict[str, Any]], bool]:
     spec = get_dataset_spec(source)
     use_streaming = spec.default_streaming if streaming is None else streaming
     if max_examples <= 0:
-        return [], use_streaming
+        return iter(()), use_streaming
     ds = load_dataset(
         path=spec.path,
         name=spec.name,
@@ -85,9 +117,9 @@ def _iter_rows(
         cache_dir=cache_dir,
     )
     if use_streaming:
-        return list(itertools.islice(ds, max_examples)), use_streaming
+        return itertools.islice(ds, max_examples), use_streaming
     upper = min(max_examples, len(ds))
-    return [ds[i] for i in range(upper)], use_streaming
+    return (ds[i] for i in range(upper)), use_streaming
 
 
 def load_corpus_text(
@@ -96,6 +128,7 @@ def load_corpus_text(
     split: str,
     max_examples: int,
     min_chars: int = 8,
+    max_chars: int | None = None,
     streaming: bool | None = None,
     cache_dir: str | None = None,
 ) -> tuple[str, dict[str, int]]:
@@ -109,16 +142,23 @@ def load_corpus_text(
     )
     kept: list[str] = []
     skipped = 0
+    total = 0
+    total_chars = 0
     for row in rows:
+        total += 1
         text = str(row.get(spec.text_field, ""))
         text = text.strip()
         if len(text) < min_chars:
             skipped += 1
             continue
+        add_len = len(text) + (2 if kept else 0)
+        if max_chars is not None and max_chars > 0 and (total_chars + add_len) > max_chars:
+            break
         kept.append(text)
+        total_chars += add_len
     corpus = "\n\n".join(kept)
     stats = {
-        "num_rows_total": len(rows),
+        "num_rows_total": total,
         "num_rows_kept": len(kept),
         "num_rows_skipped": skipped,
         "num_chars": len(corpus),

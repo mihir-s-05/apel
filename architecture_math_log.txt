@@ -1,0 +1,618 @@
+APEL-R ARCHITECTURE + MATH LOG (RUNNING DOCUMENT)
+Date started: 2026-02-11
+Maintainer: Codex iteration log
+
+=====================================================================
+0) PURPOSE OF THIS DOCUMENT
+=====================================================================
+This is the continuously updated technical log for:
+1) The exact mathematical definition of the APEL-R architecture.
+2) Why each loss term exists and what gradients it induces.
+3) Architectural changes across iterations and the reason for each.
+4) Observed behavior from experiments tied back to the math.
+
+The design target is a model that can emit tokens while maintaining and
+updating a latent high-level "plan" belief online.
+
+=====================================================================
+1) NOTATION
+=====================================================================
+Token sequence:
+- y_1, y_2, ..., y_T with y_t in {1, ..., V}
+- V = vocabulary size
+
+Chunking:
+- chunk size C
+- chunk index c = floor((t-1)/C)
+- chunk c spans t in [cC+1, ..., min((c+1)C, T)]
+
+Planner state:
+- z_c in {1, ..., K}
+- K = number of discrete plan states
+
+Belief:
+- b_t(k) = p(z_c = k | y_<=t, chunk index at t)
+  (with boundary transitions when t enters new chunk)
+
+Transition:
+- P_{ij} = p(z_{c+1}=j | z_c=i)
+- P is row-stochastic
+
+Executor hidden state:
+- h_t from GRU over token embeddings
+
+Per-plan token distribution:
+- p_theta(y_t | y_<t, z=k)
+
+=====================================================================
+2) GENERATIVE STORY (IMPLEMENTED APPROXIMATION)
+=====================================================================
+Intended latent process:
+1) Draw initial chunk plan z_0 ~ Cat(pi_0)
+2) For each chunk c:
+   - for token t inside chunk c:
+     y_t ~ p_theta(y_t | y_<t, z_c)
+   - draw next plan z_{c+1} ~ Cat(P[z_c,:])
+
+Implemented boundary context bias:
+- At chunk boundaries, the prior is adjusted by a context term from the
+  latest token hidden state:
+  prior_{c+1}(j) proportional to [sum_i b_c(i) P_{ij}] * exp(g_j(h_t))
+  where g(h_t) is planner_ctx_proj(h_t) * planner_context_scale.
+
+This turns the pure HMM transition into a context-conditioned transition
+while preserving tractable discrete-state filtering updates.
+
+=====================================================================
+3) PARAMETERIZATION
+=====================================================================
+3.1 Executor trunk
+- Token embedding E in R^{V x d_tok}
+- GRU: h_t = GRU(E[y_{t-1}], h_{t-1})
+
+3.2 Plan-conditioned emission head
+- Plan embedding u_k in R^{d_fuse}
+- Projected state s_t = W_s h_t + b_s
+- Projected plan p_k = W_p u_k
+- Joint feature:
+  j_{t,k} = tanh(s_t + p_k)
+- Token logits for plan k:
+  l_{t,k} = W_o j_{t,k} + b_o + v_k
+  where v_k in R^V is per-plan vocab bias (plan_vocab_bias row k)
+- Log probs:
+  log p_tk(v) = log softmax_v(l_{t,k})
+
+3.3 Planner parameters
+- Initial logits alpha in R^K -> pi_0 = softmax(alpha)
+- Transition logits A in R^{KxK} -> P = row_softmax(A)
+- Boundary context projection G(h_t) in R^K
+
+3.4 Chunk posterior recognizer (added 2026-02-11)
+- Chunk summary:
+  r_c = mean_{t in chunk c} h_t
+- Recognition posterior:
+  q_c = softmax(W_q r_c + b_q), q_c in Delta^{K-1}
+
+Purpose:
+- Encourage chunk evidence to map to identifiable latent state posteriors.
+
+=====================================================================
+4) EXACT FILTERING EQUATIONS USED IN TRAINING
+=====================================================================
+Given current belief b (row vector in R^K):
+
+4.1 Chunk boundary update (if entering new chunk):
+- prior = b P
+- if context bias g exists:
+  b <- softmax(log(prior + eps) + g)
+  else:
+  b <- prior
+
+4.2 Token update within chunk (Bayes filter step):
+- For observed target y_t, define per-plan log-likelihood:
+  ell_t(k) = log p_theta(y_t | y_<t, z=k)
+- Posterior:
+  b <- softmax(log(b + eps) + ell_t)
+
+This update is exact for discrete latent states under the model family
+with known per-plan likelihoods and a finite plan state space.
+
+=====================================================================
+5) PRIMARY TRAINING OBJECTIVE
+=====================================================================
+For each token t:
+- Mixture predictive log-prob:
+  log p(y_t | y_<t) = log sum_k b_{t-1}(k) * p_theta(y_t | y_<t, z=k)
+
+Sequence NLL:
+- L_nll = -(1/T) sum_t log p(y_t | y_<t)
+
+This is what filtered_nll(...) computes exactly via log-sum-exp.
+
+=====================================================================
+6) AUXILIARY / REGULARIZATION TERMS
+=====================================================================
+Total train loss:
+L_total =
+  L_nll
+  + lambda_ent * L_belief_entropy
+  + lambda_usage * L_usage_kl
+  + lambda_bow * L_chunk_bow
+  - lambda_mi * L_plan_mi
+  + lambda_post * L_chunk_post_kl
+
+All lambdas are config weights.
+
+---------------------------------------------------------------------
+6.1 Belief entropy term
+---------------------------------------------------------------------
+Per token posterior entropy:
+H(b_t) = -sum_k b_t(k) log b_t(k)
+
+Running mean:
+L_belief_entropy = (1/T) sum_t H(b_t)
+
+Sign in total loss is positive with lambda_ent >= 0.
+So larger lambda_ent encourages higher posterior entropy (less peaky).
+If sharper posteriors are desired, lambda_ent should be reduced.
+
+---------------------------------------------------------------------
+6.2 Usage-balance KL
+---------------------------------------------------------------------
+Average state usage over sequence:
+u_k = (1/T) sum_t b_t(k)
+
+Uniform target:
+u^*_k = 1/K
+
+KL to uniform:
+L_usage_kl = KL(u || u^*) = sum_k u_k [log u_k - log(1/K)]
+
+Positive lambda_usage penalizes collapse to a few states.
+
+---------------------------------------------------------------------
+6.3 Chunk BOW predictive term
+---------------------------------------------------------------------
+For chunk c:
+1) Empirical chunk token histogram:
+   h_c(v) = average one-hot count in chunk
+2) Per-plan chunk-average token distribution:
+   p_c(v|k) = average over chunk positions of p_t(v|k)
+3) Belief mixture at chunk start:
+   p_mix_c(v) = sum_k b_start_c(k) p_c(v|k)
+
+Chunk CE:
+L_bow_c = -sum_v h_c(v) log p_mix_c(v)
+
+Loss:
+L_chunk_bow = average_c L_bow_c
+
+Interpretation:
+- Forces the latent plan belief and per-plan emissions to carry signal
+  about chunk-level lexical composition.
+- Can overpower token NLL early if weighted too strongly; warmup helps.
+
+---------------------------------------------------------------------
+6.4 Plan mutual-information surrogate
+---------------------------------------------------------------------
+At token t with current belief b_t:
+- Mixture distribution:
+  p_mix(v) = sum_k b_t(k) p(v|k)
+- Entropy:
+  H_mix = H(p_mix)
+- Conditional entropy under plan:
+  H_cond = sum_k b_t(k) H(p(.|k))
+
+MI surrogate:
+I_t = H_mix - H_cond
+
+Loss term used:
+L_plan_mi = average_t I_t
+
+Since L_total subtracts lambda_mi * L_plan_mi, training maximizes this
+MI surrogate. Effect:
+- Encourages plan-conditioned token distributions p(.|k) to differ.
+- Helps identifiability by reducing emission overlap across states.
+
+---------------------------------------------------------------------
+6.5 Chunk posterior alignment KL (new)
+---------------------------------------------------------------------
+For chunk c:
+1) q_c = recognition posterior from chunk summary (W_q r_c + b_q)
+2) p_c = filtered posterior after consuming full chunk tokens, starting
+   from current chunk-start belief and applying Bayes updates token-wise.
+
+Symmetric KL:
+L_post_c = 0.5 * [ KL(q_c || p_c) + KL(p_c || q_c) ]
+
+Loss:
+L_chunk_post_kl = average_c L_post_c
+
+Effect:
+- Couples planner posterior dynamics with chunk evidence summarization.
+- Encourages chunk evidence to map to a stable latent explanation.
+- Stronger plan identifiability than BOW alone because it aligns
+  chunk-level inferred state distributions directly.
+
+=====================================================================
+7) IDENTIFIABILITY DISCUSSION
+=====================================================================
+Latent-state models have permutation invariance:
+- Any permutation of state labels yields identical likelihood.
+This is expected and not harmful for generation quality.
+
+Practical identifiability goal here:
+- Not absolute label identity, but stable and distinct state semantics.
+
+Signals promoting distinguishable states:
+1) MI maximization (separates per-plan emissions).
+2) Chunk BOW prediction (forces plan to capture chunk lexical patterns).
+3) Chunk posterior KL alignment (ties chunk evidence to posterior states).
+4) Transition self-bias initialization (prevents immediate uniform mixing).
+5) Usage regularization (prevents single-state collapse).
+
+Failure modes to watch:
+1) Posterior collapse:
+   b_t nearly constant uniform; MI near zero.
+2) State starvation:
+   usage KL high, a few states dominate.
+3) Degenerate separation:
+   per-plan distributions differ in function-word artifacts but do not
+   encode meaningful chunk semantics.
+
+Diagnostics to track:
+1) L_plan_mi increasing from near zero.
+2) Usage KL moderate (not near 0 with totally uniform noise, not huge).
+3) Transition matrix row maxima and diagonal dominance.
+4) Chunk_post_kl decreasing over training.
+5) Qualitative sample diversity conditioned on top posterior state.
+
+=====================================================================
+8) COMPUTATIONAL COMPLEXITY
+=====================================================================
+Let B=batch size, T=seq len, K=plan states, V=vocab size, H=hidden dim.
+
+Dominant costs:
+1) GRU trunk: O(B*T*H^2) (plus embedding/projection terms)
+2) Per-plan logits: O(B*T*K*V) at emission projection/softmax
+3) Filtering updates: O(B*T*K)
+4) Chunk extras:
+   - BOW mix: O(num_chunks * B * K * V)
+   - Chunk posterior KL rollout: O(num_chunks * B * chunk_len * K)
+
+Memory hotspot:
+- log_probs tensor [B,T,K,V] is large and can dominate memory.
+This can be optimized later by chunkwise computation if needed.
+
+=====================================================================
+9) CHANGE LOG (ARCHITECTURE + MATH)
+=====================================================================
+[2026-02-11 | baseline]
+- Exact filtered mixture over discrete planner states.
+- Static transition matrix (with optional self-bias init).
+- Loss: NLL + entropy/usage regularization.
+
+[2026-02-11 | identifiability pass 1]
+- Added per-plan vocab bias and stronger planner initialization controls.
+- Motivation: increase planner impact on emissions.
+
+[2026-02-11 | identifiability pass 2]
+- Added chunk-level BOW auxiliary.
+- Motivation: make plan state predictive of chunk lexical content.
+
+[2026-02-11 | identifiability pass 3]
+- Added MI surrogate term H(mix)-E[H(cond)].
+- Motivation: encourage plan-conditioned emission diversity.
+
+[2026-02-11 | identifiability pass 4]
+- Added chunk BOW warmup scheduling.
+- Motivation: prevent auxiliary from dominating early NLL optimization.
+
+[2026-02-11 | identifiability pass 5 (current)]
+- Added chunk posterior recognition head q_c and symmetric KL alignment
+  to filtered chunk posterior p_c.
+- Added train weight knob: chunk_post_kl_weight.
+- Rationale:
+  BOW and MI encourage separation, but not direct chunk->posterior
+  consistency. This term directly aligns chunk evidence with planner
+  posterior geometry.
+
+=====================================================================
+10) CURRENT HYPOTHESES FOR NEXT ITERATIONS
+=====================================================================
+H1:
+- Increasing vocab size with BPE (2k->4k) improves lexical coherence
+  faster than character tokenization at the same parameter budget.
+
+H2:
+- chunk_post_kl_weight in moderate range (0.04-0.12) improves latent
+  plan stability without harming perplexity too much.
+
+H3:
+- Longer training horizon (>=300-1000 steps on CPU) is required before
+  judging coherence for 10M+ parameter models.
+
+H4:
+- Multi-source curriculum (TinyStories -> WikiText2/103 -> FineWeb/C4
+  subset) yields better robustness and less repetitive sampling.
+
+=====================================================================
+11) EXPERIMENT LOG TEMPLATE (APPEND EACH RUN)
+=====================================================================
+Run ID:
+Config:
+Date:
+Dataset source:
+Tokenizer:
+Params:
+
+Final metrics:
+- val_loss:
+- val_ppl:
+- belief_entropy:
+- usage_kl_to_uniform:
+- chunk_bow_loss:
+- plan_mi:
+- chunk_post_kl:
+
+Transition diagnostics:
+- mean_row_max:
+- mean_diag:
+- entropy_rows:
+
+Qualitative sample notes:
+- coherence:
+- repetition:
+- plan-lookahead behavior:
+
+Decision for next run:
+- keep/change:
+- reason:
+
+=====================================================================
+12) APPENDED RUN RECORDS
+=====================================================================
+[Run record | 2026-02-11]
+Run ID: runs/tinystories_bpe_mi_scale
+Config: configs/tinystories_bpe_mi_scale.yaml
+Dataset source: tinystories
+Tokenizer: BPE vocab=2048
+Params: 11,715,192
+
+Final metrics:
+- val_loss: 5.9585
+- val_ppl: 387.0308
+- belief_entropy: 2.2959
+- usage_kl_to_uniform: 0.0046
+- chunk_bow_loss: 5.9590
+- plan_mi: 0.0001
+- chunk_post_kl: n/a (objective not yet enabled in this run)
+
+Transition diagnostics:
+- mean_row_max: 0.3952
+- mean_diag: 0.3952
+- mean_row_entropy: 2.0000
+
+Qualitative sample notes:
+- coherence: weak phrase-level coherence, mostly high-frequency fragments
+- repetition: high repetition of function words and short cliches
+- plan-lookahead behavior: low specialization signal due near-zero plan_mi
+
+Decision:
+- change: add chunk posterior alignment objective with non-zero weight
+- reason: larger scale alone did not produce state specialization; direct
+  posterior alignment is needed to improve identifiability
+
+[Run record | 2026-02-11]
+Run ID: runs/tinystories_bpe_ident_cpk_scale
+Config: configs/tinystories_bpe_ident_cpk_scale.yaml
+Dataset source: tinystories
+Tokenizer: BPE vocab=4096
+Params: 17,916,980
+
+Final metrics:
+- val_loss: 5.9835
+- val_ppl: 396.8070
+- belief_entropy: 2.4782
+- usage_kl_to_uniform: 0.0053
+- chunk_bow_loss: 5.9826
+- plan_mi: 0.0000 (4e-05 scale)
+- chunk_post_kl: 0.0139
+
+Observations:
+- chunk_post_kl reduced over run, indicating recognizer/posterior alignment.
+- Sample quality remained repetitive and mostly function-word heavy.
+- Planner MI still collapsed on evaluation distribution.
+
+Decision:
+- change: continue from this checkpoint with sharper objective weights
+  (negative entropy reg + larger plan_mi and chunk_post_kl weights).
+
+[Run record | 2026-02-11]
+Run ID: runs/tinystories_bpe_ident_resume_sharp
+Config: configs/tinystories_bpe_ident_resume_sharp.yaml
+Dataset source: tinystories
+Tokenizer: BPE vocab=4096 (loaded from resume checkpoint)
+Params: 17,916,980
+
+Final metrics:
+- val_loss: 5.5385
+- val_ppl: 254.2983
+- belief_entropy: 2.4637
+- usage_kl_to_uniform: 0.0078
+- chunk_bow_loss: 5.8978
+- plan_mi: 0.0000 (4e-05 scale)
+- chunk_post_kl: 0.0379
+
+Transition diagnostics:
+- mean_row_max: 0.3360
+- mean_diag: 0.3360
+- mean_row_entropy: 2.2305
+
+Observations:
+- Perplexity improved materially vs prior run, but textual coherence is
+  still limited.
+- Stronger planner losses did not prevent eval-time MI collapse.
+
+[Run record | 2026-02-11]
+Run ID: runs/wikitext2_bpe_ident_cpk_smoke
+Config: configs/wikitext2_bpe_ident_cpk_smoke.yaml
+Dataset source: wikitext2
+Tokenizer: BPE vocab=4096
+Params: 13,318,274
+
+Final metrics:
+- val_loss: 6.9581
+- val_ppl: 1051.6712
+- belief_entropy: 2.2989
+- usage_kl_to_uniform: 0.0030
+- chunk_bow_loss: 6.9579
+- plan_mi: 0.0000 (3e-06 scale)
+- chunk_post_kl: 0.0093
+
+Observations:
+- Cross-domain data pipeline works and downloads are validated.
+- Run length was too short for coherent expository text.
+
+=====================================================================
+13) CURRENT DIAGNOSIS AFTER LATEST RUNS
+=====================================================================
+Empirical pattern:
+1) Batch-level training logs can show non-trivial plan_mi (~1e-2),
+   while evaluation mean plan_mi remains ~0 (1e-5 scale).
+2) This indicates planner specialization is not stable across evaluation
+   distribution or collapses when averaged over full batches/chunks.
+
+Possible causes:
+1) Planner losses are too weak relative to NLL for persistent separation.
+2) Mixture head can satisfy NLL with near-shared per-plan emissions.
+3) Positive entropy of belief (or weakly negative entropy) keeps planner
+   posteriors broad enough that useful state specialization is diluted.
+4) Label permutation/symmetry combined with weak inductive bias makes
+   stable state semantics hard to maintain.
+
+Next high-priority math interventions:
+1) Replace/augment MI surrogate with direct pairwise JS divergence between
+   per-plan token distributions (possibly top-vocab approximation).
+2) Add low-entropy prior on belief at chunk boundaries while keeping usage
+   balance regularization to avoid single-state collapse.
+3) Add contrastive chunk objective: same state should predict consistent
+   chunk-level feature embeddings; different states should separate.
+4) Introduce curriculum on lambda weights:
+   - early: stronger NLL, weaker planner terms
+   - mid: ramp planner separation + posterior alignment
+   - late: small annealing to avoid over-regularization artifacts.
+
+=====================================================================
+14) V2 IMPLEMENTATION NOTES (2026-02-12)
+=====================================================================
+Implemented model versioning:
+1) v1_filtered_mixture (legacy default)
+2) v2_planner_required (new)
+
+V2 architectural core:
+1) Chunk planner states inferred from chunk summaries.
+2) Token emissions from planner-conditioned experts only:
+   p(y_t|context) = sum_k b_{c(t)}(k) p_k(y_t|h_t)
+3) No shared high-capacity bypass head.
+
+V2 training losses now available:
+1) NLL
+2) Usage KL to uniform
+3) Boundary entropy term over chunk posteriors
+4) Future contrastive loss (InfoNCE between current plan vector and
+   future chunk embeddings)
+5) Pairwise plan JS divergence across expert token distributions
+
+V2 planner diagnostics now available:
+1) planner_mask_delta_loss
+2) forced_state_divergence
+3) state_persistence
+4) expert_utilization
+
+Checkpoint metadata additions:
+1) model_version
+2) config_schema_version
+3) tokenizer_hash
+
+CUDA-oriented training controls added:
+1) train.precision (fp32/fp16/bf16)
+2) train.grad_accum_steps
+3) train.loss_weights.* for V2 objectives
+
+[2026-02-11 | training-systems update]
+- Added periodic checkpointing + resume support
+  (optimizer state, global step, model state).
+- New knobs:
+  - save_interval
+  - resume_from
+- Rationale:
+  Long CPU runs are now recoverable and can be scaled over multiple
+  sessions without restarting from step 0.
+
+=====================================================================
+15) CUDA ENABLEMENT + EMPIRICAL CHECK (2026-02-11)
+=====================================================================
+Environment:
+1) torch upgraded to 2.6.0+cu124 in project venv.
+2) Verified:
+   - torch.cuda.is_available() = True
+   - single GPU detected: RTX 4070 Laptop (8 GB)
+3) Restored fsspec compatibility for datasets pipeline:
+   - fsspec pinned to 2025.10.0 to satisfy datasets constraints.
+
+GPU smoke run (WikiText-2, V2, 4 steps) summary:
+1) Final val NLL ~ 6.8290 (ppl ~ 924.28), expectedly high at tiny budget.
+2) Planner usage diagnostics:
+   - usage_kl_to_uniform ~ 0.00249 (near-uniform usage)
+   - state_persistence ~ 0.85714 (sticky chunk states)
+   - expert_utilization ~ 0.99861 (almost all experts touched)
+   - forced_state_divergence ~ 0.00185 (small but non-zero planner impact)
+   - planner_mask_delta_loss ~ 0.00029 (small distributional shift under masking)
+
+Math interpretation:
+1) High persistence + near-uniform usage at tiny step counts suggests
+   planner dynamics are active but weakly specialized.
+2) Very low forced-state divergence and mask-delta indicate token
+   distribution changes under planner interventions are still small.
+3) This is consistent with early-training regime where:
+   - b_c(z) is diffuse,
+   - expert heads are not yet significantly separated,
+   - contrastive/divergence auxiliaries need longer horizon to shape state semantics.
+
+Consequence for scaling:
+1) Continue with longer CUDA runs so auxiliary terms can separate expert
+   token distributions while NLL decreases.
+2) Gate scaling decisions on growth in intervention sensitivity metrics:
+   - forced_state_divergence should increase from near-zero baseline,
+   - planner_mask_delta_loss should increase moderately without hurting NLL trend,
+   - usage_kl should remain bounded (avoid single-state collapse).
+
+=====================================================================
+16) LONGER CUDA V2 RUN CHECKPOINT (TinyStories, 120 steps)
+=====================================================================
+Observed metrics (runs/tinystories_v2_fastiter_a1):
+1) val_loss ~ 5.9845, ppl ~ 397.23
+2) usage_kl_to_uniform ~ 0.0794
+3) boundary_entropy ~ 2.1903 (for K=10, max entropy log(K)=2.3026)
+4) plan_js_div_loss ~ 0.3794
+5) forced_state_divergence ~ 0.3275
+6) state_persistence ~ 0.8571
+7) expert_utilization ~ 0.9655
+
+Interpretation:
+1) forced_state_divergence moved from near-zero smoke values (~1e-3) to
+   O(1e-1), which is strong evidence that planner state interventions now
+   meaningfully perturb token distribution.
+2) boundary entropy remains below log(K), so posterior is not uniform;
+   however it is still relatively high, meaning state assignments are not
+   fully sharp yet.
+3) non-trivial plan_js_div indicates expert token distributions are
+   separating; this aligns with improved intervention sensitivity.
+4) usage_kl remains moderate (not collapsed to one state), consistent with
+   balanced but imperfect specialization.
+
+Mathematical takeaway:
+1) V2 objective stack is no longer in "inactive planner" regime on this run.
+2) Remaining gap is mostly in sharpening plan posterior and lexical quality,
+   not in activating planner-expert coupling.

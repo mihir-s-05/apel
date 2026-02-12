@@ -10,6 +10,7 @@ dependencies = [
   "numpy",
   "pyyaml",
   "tqdm",
+  "tokenizers",
 ]
 
 [build-system]
@@ -18,4 +19,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/apelr"]
-
