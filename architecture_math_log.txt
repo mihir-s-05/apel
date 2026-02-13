@@ -616,3 +616,20 @@ Mathematical takeaway:
 1) V2 objective stack is no longer in "inactive planner" regime on this run.
 2) Remaining gap is mostly in sharpening plan posterior and lexical quality,
    not in activating planner-expert coupling.
+
+=====================================================================
+17) ALIGNMENT UPDATE (2026-02-13)
+=====================================================================
+Code-path updates applied to align implementation with two-stream spec:
+1) Generation now supports asynchronous planner forecasting in a background
+   worker thread (async_planner) while token decoding continues.
+2) Planner lookahead is no longer introspection-only: the emission gate can
+   blend current belief with lookahead mean (lookahead_feedback_scale).
+3) This establishes bidirectional coupling in generation:
+   - output -> planner via per-token posterior updates
+   - planner lookahead -> output via gate blending
+4) planner_mask_delta_loss confound was reduced by using the same
+   token-filtering path across planner modes in compute_losses.
+5) New-run default model selection now resolves to V2 when no explicit
+   model version is provided in config.
+

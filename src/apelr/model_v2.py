@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import math
 from dataclasses import dataclass
 
@@ -23,6 +24,9 @@ class APELRV2ModelConfig:
     future_horizon_chunks: int = 2
     planner_temperature: float = 1.0
     token_filtering: bool = True
+    lookahead_horizon: int = 2
+    lookahead_feedback_scale: float = 0.25
+    async_planner: bool = True
     eps: float = 1e-9
 
 
@@ -209,6 +213,71 @@ class APELRV2Model(nn.Module):
         token_states = chunk_states[:, token_chunk_idx, :]
         return torch.logsumexp(self._belief_log(token_states).unsqueeze(-1) + expert_log_probs, dim=2)
 
+    def _lookahead_first_mean(
+        self,
+        belief: torch.Tensor,
+        transition: torch.Tensor,
+        steps: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if steps <= 0:
+            return belief, belief
+        cur = belief
+        first: torch.Tensor | None = None
+        acc = torch.zeros_like(belief)
+        for s in range(steps):
+            cur = cur @ transition
+            if s == 0:
+                first = cur
+            acc = acc + cur
+        mean = acc / float(steps)
+        return (belief if first is None else first), mean
+
+    def _planner_gate_with_lookahead(
+        self,
+        belief: torch.Tensor,
+        transition: torch.Tensor,
+        *,
+        planner_temperature: float,
+        lookahead_steps: int,
+        feedback_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mixed = belief
+        first = belief
+        if lookahead_steps > 0 and feedback_scale > 0.0:
+            first, future_mean = self._lookahead_first_mean(belief, transition, lookahead_steps)
+            alpha = min(max(float(feedback_scale), 0.0), 1.0)
+            mixed = (1.0 - alpha) * belief + alpha * future_mean
+        tau = max(float(planner_temperature), 1e-4)
+        gate = F.softmax(self._belief_log(mixed) / tau, dim=-1)
+        return gate, first
+
+    def _chunk_states_with_feedback(
+        self,
+        chunk_states: torch.Tensor,
+        transition: torch.Tensor,
+        *,
+        planner_mode: str,
+        planner_temperature: float,
+        lookahead_steps: int,
+        feedback_scale: float,
+    ) -> torch.Tensor:
+        if chunk_states.shape[1] == 0:
+            return chunk_states
+        if planner_mode != "normal":
+            tau = max(float(planner_temperature), 1e-4)
+            return F.softmax(self._belief_log(chunk_states) / tau, dim=-1)
+        gates: list[torch.Tensor] = []
+        for c in range(chunk_states.shape[1]):
+            gate_c, _ = self._planner_gate_with_lookahead(
+                chunk_states[:, c, :],
+                transition,
+                planner_temperature=planner_temperature,
+                lookahead_steps=int(lookahead_steps),
+                feedback_scale=float(feedback_scale),
+            )
+            gates.append(gate_c)
+        return torch.stack(gates, dim=1)
+
     def _future_contrastive_loss(self, chunk_states: torch.Tensor, chunk_summary: torch.Tensor) -> torch.Tensor:
         bsz, num_chunks, _ = chunk_summary.shape
         if num_chunks <= 1:
@@ -266,6 +335,9 @@ class APELRV2Model(nn.Module):
         forced_state: int | None = None,
         commitment: str = "soft",
         planner_temperature: float | None = None,
+        lookahead_steps: int | None = None,
+        lookahead_feedback_scale: float | None = None,
+        token_filtering: bool | None = None,
         rep_unlikelihood_window: int = 0,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
@@ -284,7 +356,17 @@ class APELRV2Model(nn.Module):
         )
 
         expert_log_probs = self._expert_log_probs(h)
-        if self.cfg.token_filtering and planner_mode == "normal":
+        trans = self.transition_matrix()
+        effective_token_filtering = bool(self.cfg.token_filtering if token_filtering is None else token_filtering)
+        effective_lookahead_steps = max(
+            0,
+            int(self.cfg.lookahead_horizon if lookahead_steps is None else lookahead_steps),
+        )
+        effective_feedback_scale = min(
+            max(float(self.cfg.lookahead_feedback_scale if lookahead_feedback_scale is None else lookahead_feedback_scale), 0.0),
+            1.0,
+        )
+        if effective_token_filtering:
             bsz, seq_len = input_ids.shape
             mix_steps: list[torch.Tensor] = []
             cur_chunk = int(token_chunk_idx[0].item()) if seq_len > 0 else 0
@@ -294,7 +376,14 @@ class APELRV2Model(nn.Module):
                 if c != cur_chunk:
                     cur_chunk = c
                     belief_t = chunk_states[:, cur_chunk, :]
-                mix_t = torch.logsumexp(self._belief_log(belief_t).unsqueeze(-1) + expert_log_probs[:, t, :, :], dim=1)
+                gate_t, _ = self._planner_gate_with_lookahead(
+                    belief_t,
+                    trans,
+                    planner_temperature=planner_temperature if planner_temperature is not None else self.cfg.planner_temperature,
+                    lookahead_steps=effective_lookahead_steps if planner_mode == "normal" else 0,
+                    feedback_scale=effective_feedback_scale if planner_mode == "normal" else 0.0,
+                )
+                mix_t = torch.logsumexp(self._belief_log(gate_t).unsqueeze(-1) + expert_log_probs[:, t, :, :], dim=1)
                 mix_steps.append(mix_t)
                 tgt = target_ids[:, t]
                 obs_logp = torch.gather(
@@ -302,10 +391,19 @@ class APELRV2Model(nn.Module):
                     dim=-1,
                     index=tgt.view(-1, 1, 1).expand(-1, self.num_plan_states, 1),
                 ).squeeze(-1)
-                belief_t = F.softmax(self._belief_log(belief_t) + obs_logp, dim=-1)
+                if planner_mode == "normal":
+                    belief_t = F.softmax(self._belief_log(belief_t) + obs_logp, dim=-1)
             mix_log_probs = torch.stack(mix_steps, dim=1)
         else:
-            mix_log_probs = self._mixture_log_probs(expert_log_probs, chunk_states, token_chunk_idx)
+            chunk_gates = self._chunk_states_with_feedback(
+                chunk_states,
+                trans,
+                planner_mode=planner_mode,
+                planner_temperature=planner_temperature if planner_temperature is not None else self.cfg.planner_temperature,
+                lookahead_steps=effective_lookahead_steps,
+                feedback_scale=effective_feedback_scale,
+            )
+            mix_log_probs = self._mixture_log_probs(expert_log_probs, chunk_gates, token_chunk_idx)
         tok_nll = F.nll_loss(
             mix_log_probs.reshape(-1, self.vocab_size),
             target_ids.reshape(-1),
@@ -349,9 +447,24 @@ class APELRV2Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         target_ids: torch.Tensor,
+        *,
+        commitment: str = "soft",
+        planner_temperature: float | None = None,
     ) -> dict[str, torch.Tensor]:
-        base_nll, aux = self.compute_losses(input_ids, target_ids, planner_mode="normal", commitment="soft")
-        masked_nll, _ = self.compute_losses(input_ids, target_ids, planner_mode="uniform_mask", commitment="soft")
+        base_nll, aux = self.compute_losses(
+            input_ids,
+            target_ids,
+            planner_mode="normal",
+            commitment=commitment,
+            planner_temperature=planner_temperature,
+        )
+        masked_nll, _ = self.compute_losses(
+            input_ids,
+            target_ids,
+            planner_mode="uniform_mask",
+            commitment=commitment,
+            planner_temperature=planner_temperature,
+        )
         planner_mask_delta = masked_nll - base_nll
 
         bsz, seq_len = input_ids.shape
@@ -398,6 +511,9 @@ class APELRV2Model(nn.Module):
         force_state: int | None = None,
         freeze_planner: bool = False,
         planner_temperature: float = 1.0,
+        lookahead_feedback_scale: float | None = None,
+        async_planner: bool | None = None,
+        token_filtering: bool | None = None,
         repetition_penalty: float = 1.0,
         no_repeat_ngram_size: int = 0,
     ) -> tuple[list[int], list[list[float]]]:
@@ -412,8 +528,21 @@ class APELRV2Model(nn.Module):
         belief = self._initial_belief(1, device)
         trans = self.transition_matrix()
         lookahead_trace: list[list[float]] = []
+        think_steps = max(0, int(lookahead_steps))
+        feedback_scale = float(
+            self.cfg.lookahead_feedback_scale if lookahead_feedback_scale is None else lookahead_feedback_scale
+        )
+        feedback_scale = min(max(feedback_scale, 0.0), 1.0)
+        use_token_filtering = bool(self.cfg.token_filtering if token_filtering is None else token_filtering)
+        use_async_planner = bool(self.cfg.async_planner if async_planner is None else async_planner)
         token_pos = 0
         chunk_hidden_buffer: list[torch.Tensor] = []
+        planner_pool: ThreadPoolExecutor | None = None
+        planner_future: Future[tuple[int, torch.Tensor, torch.Tensor]] | None = None
+        latest_first_cpu: torch.Tensor | None = None
+        latest_mean_cpu: torch.Tensor | None = None
+        latest_forecast_token_pos: int | None = None
+        trans_cpu = trans.detach().to("cpu")
 
         def maybe_boundary_update() -> None:
             nonlocal belief
@@ -440,6 +569,54 @@ class APELRV2Model(nn.Module):
                     banned.add(int(ngram[-1]))
             return banned
 
+        def planner_source_belief() -> torch.Tensor:
+            if force_state is None:
+                return belief
+            src = torch.zeros_like(belief)
+            src[:, int(force_state)] = 1.0
+            return src
+
+        def compute_lookahead_cpu(
+            forecast_token_pos: int,
+            belief_cpu: torch.Tensor,
+        ) -> tuple[int, torch.Tensor, torch.Tensor]:
+            if think_steps <= 0:
+                return forecast_token_pos, belief_cpu, belief_cpu
+            cur = belief_cpu
+            first: torch.Tensor | None = None
+            acc = torch.zeros_like(belief_cpu)
+            for s in range(think_steps):
+                cur = cur @ trans_cpu
+                if s == 0:
+                    first = cur
+                acc = acc + cur
+            mean = acc / float(think_steps)
+            return forecast_token_pos, (belief_cpu if first is None else first), mean
+
+        def maybe_collect_async_forecast() -> None:
+            nonlocal planner_future, latest_first_cpu, latest_mean_cpu, latest_forecast_token_pos
+            if planner_future is None or not planner_future.done():
+                return
+            forecast_token_pos, first, mean = planner_future.result()
+            latest_forecast_token_pos = int(forecast_token_pos)
+            latest_first_cpu = first
+            latest_mean_cpu = mean
+            planner_future = None
+
+        def maybe_submit_async_forecast(src_belief: torch.Tensor, forecast_token_pos: int) -> None:
+            nonlocal planner_future
+            if planner_pool is None or think_steps <= 0:
+                return
+            if planner_future is None:
+                planner_future = planner_pool.submit(
+                    compute_lookahead_cpu,
+                    int(forecast_token_pos),
+                    src_belief.detach().to("cpu"),
+                )
+
+        if use_async_planner and think_steps > 0:
+            planner_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="apel_planner")
+
         for tok in prompt_ids:
             tok_t = torch.tensor([[tok]], device=device, dtype=torch.long)
             out, hidden = self.backbone(self.token_emb(tok_t), hidden)
@@ -449,76 +626,97 @@ class APELRV2Model(nn.Module):
                 maybe_boundary_update()
                 chunk_hidden_buffer = []
 
-        for _ in range(max_new_tokens):
-            state = hidden[-1, :, :] if hidden is not None else torch.zeros((1, self.cfg.hidden_dim), device=device)
-            expert_logits = torch.stack([head(state) for head in self.expert_heads], dim=1)
-            expert_log_probs = F.log_softmax(expert_logits, dim=-1).squeeze(0)
+        maybe_submit_async_forecast(planner_source_belief(), token_pos)
+        try:
+            for _ in range(max_new_tokens):
+                maybe_collect_async_forecast()
 
-            if force_state is not None:
-                gate = torch.zeros((self.num_plan_states,), device=device)
-                gate[int(force_state)] = 1.0
-            else:
-                gate = belief.squeeze(0)
-            gate = F.softmax((gate + self.eps).log() / max(planner_temperature, 1e-4), dim=-1)
+                state = hidden[-1, :, :] if hidden is not None else torch.zeros((1, self.cfg.hidden_dim), device=device)
+                expert_logits = torch.stack([head(state) for head in self.expert_heads], dim=1)
+                expert_log_probs = F.log_softmax(expert_logits, dim=-1).squeeze(0)
 
-            mix_log = torch.logsumexp((gate + self.eps).log().unsqueeze(-1) + expert_log_probs, dim=0)
-            if repetition_penalty > 1.0:
-                seen = torch.tensor(sorted(set(seq)), device=device, dtype=torch.long)
-                mix_log = mix_log.clone()
-                mix_log[seen] = mix_log[seen] - math.log(repetition_penalty)
-            if temperature != 1.0:
-                probs = F.softmax(mix_log / max(temperature, 1e-4), dim=-1)
-            else:
-                probs = F.softmax(mix_log, dim=-1)
+                source_belief = planner_source_belief()
+                first_forecast = source_belief
+                future_mean = source_belief
+                if think_steps > 0:
+                    if (
+                        latest_first_cpu is not None
+                        and latest_mean_cpu is not None
+                        and latest_forecast_token_pos == token_pos
+                    ):
+                        first_forecast = latest_first_cpu.to(device=device)
+                        future_mean = latest_mean_cpu.to(device=device)
+                    else:
+                        first_forecast, future_mean = self._lookahead_first_mean(source_belief, trans, think_steps)
 
-            if no_repeat_ngram_size > 0:
-                banned = banned_tokens_for_no_repeat_ngram(seq, int(no_repeat_ngram_size))
-                if banned:
-                    banned_idx = torch.tensor(sorted(banned), device=device, dtype=torch.long)
-                    probs = probs.clone()
-                    probs[banned_idx] = 0.0
+                if force_state is not None:
+                    mixed_gate = source_belief
+                elif think_steps > 0 and feedback_scale > 0.0:
+                    mixed_gate = (1.0 - feedback_scale) * source_belief + feedback_scale * future_mean
+                else:
+                    mixed_gate = source_belief
+                gate = F.softmax(self._belief_log(mixed_gate.squeeze(0)) / max(planner_temperature, 1e-4), dim=-1)
 
-            if top_k is not None and top_k > 0 and top_k < probs.numel():
-                top_vals, top_idx = torch.topk(probs, k=top_k)
-                probs = torch.zeros_like(probs).scatter(0, top_idx, top_vals)
+                mix_log = torch.logsumexp((gate + self.eps).log().unsqueeze(-1) + expert_log_probs, dim=0)
+                if repetition_penalty > 1.0:
+                    seen = torch.tensor(sorted(set(seq)), device=device, dtype=torch.long)
+                    mix_log = mix_log.clone()
+                    mix_log[seen] = mix_log[seen] - math.log(repetition_penalty)
+                if temperature != 1.0:
+                    probs = F.softmax(mix_log / max(temperature, 1e-4), dim=-1)
+                else:
+                    probs = F.softmax(mix_log, dim=-1)
 
-            if top_p < 1.0:
-                sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-                cum = torch.cumsum(sorted_probs, dim=0)
-                keep = cum <= top_p
-                if keep.numel() > 0:
-                    keep[0] = True
-                filtered = torch.zeros_like(probs)
-                filtered[sorted_idx[keep]] = probs[sorted_idx[keep]]
-                probs = filtered
+                if no_repeat_ngram_size > 0:
+                    banned = banned_tokens_for_no_repeat_ngram(seq, int(no_repeat_ngram_size))
+                    if banned:
+                        banned_idx = torch.tensor(sorted(banned), device=device, dtype=torch.long)
+                        probs = probs.clone()
+                        probs[banned_idx] = 0.0
 
-            probs_sum = probs.sum()
-            if probs_sum <= 0:
-                probs = F.softmax(mix_log, dim=-1)
-            else:
-                probs = probs / probs_sum
-            next_id = int(torch.multinomial(probs, 1).item())
+                if top_k is not None and top_k > 0 and top_k < probs.numel():
+                    top_vals, top_idx = torch.topk(probs, k=top_k)
+                    probs = torch.zeros_like(probs).scatter(0, top_idx, top_vals)
 
-            seq.append(next_id)
-            if not freeze_planner and force_state is None:
-                obs_logp = expert_log_probs[:, next_id].unsqueeze(0)
-                belief = F.softmax(self._belief_log(belief) + obs_logp, dim=-1)
-            tok_t = torch.tensor([[next_id]], device=device, dtype=torch.long)
-            out, hidden = self.backbone(self.token_emb(tok_t), hidden)
-            chunk_hidden_buffer.append(out[:, -1, :])
-            token_pos += 1
+                if top_p < 1.0:
+                    sorted_probs, sorted_idx = torch.sort(probs, descending=True)
+                    cum = torch.cumsum(sorted_probs, dim=0)
+                    keep = cum <= top_p
+                    if keep.numel() > 0:
+                        keep[0] = True
+                    filtered = torch.zeros_like(probs)
+                    filtered[sorted_idx[keep]] = probs[sorted_idx[keep]]
+                    probs = filtered
 
-            if lookahead_steps > 0:
-                cur = belief
-                for _s in range(lookahead_steps):
-                    cur = cur @ trans
-                lookahead_trace.append(cur.squeeze(0).detach().cpu().tolist())
+                probs_sum = probs.sum()
+                if probs_sum <= 0:
+                    probs = F.softmax(mix_log, dim=-1)
+                else:
+                    probs = probs / probs_sum
+                next_id = int(torch.multinomial(probs, 1).item())
 
-            if token_pos % self.chunk_size == 0:
-                maybe_boundary_update()
-                chunk_hidden_buffer = []
+                seq.append(next_id)
+                if use_token_filtering and (not freeze_planner) and force_state is None:
+                    obs_logp = expert_log_probs[:, next_id].unsqueeze(0)
+                    belief = F.softmax(self._belief_log(belief) + obs_logp, dim=-1)
+                tok_t = torch.tensor([[next_id]], device=device, dtype=torch.long)
+                out, hidden = self.backbone(self.token_emb(tok_t), hidden)
+                chunk_hidden_buffer.append(out[:, -1, :])
+                token_pos += 1
 
-            if eos_id is not None and next_id == eos_id:
-                break
+                if think_steps > 0:
+                    lookahead_trace.append(first_forecast.squeeze(0).detach().cpu().tolist())
+
+                if token_pos % self.chunk_size == 0:
+                    maybe_boundary_update()
+                    chunk_hidden_buffer = []
+
+                maybe_submit_async_forecast(planner_source_belief(), token_pos)
+
+                if eos_id is not None and next_id == eos_id:
+                    break
+        finally:
+            if planner_pool is not None:
+                planner_pool.shutdown(wait=False, cancel_futures=True)
 
         return seq, lookahead_trace

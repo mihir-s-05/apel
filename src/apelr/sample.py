@@ -24,6 +24,8 @@ def main() -> None:
     parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--no-repeat-ngram-size", type=int, default=0)
     parser.add_argument("--lookahead-steps", type=int, default=2)
+    parser.add_argument("--lookahead-feedback-scale", type=float, default=None)
+    parser.add_argument("--no-async-planner", action="store_true")
     parser.add_argument("--force-state", type=int, default=None)
     parser.add_argument("--freeze-planner", action="store_true")
     parser.add_argument("--planner-temperature", type=float, default=1.0)
@@ -85,6 +87,8 @@ def main() -> None:
             force_state=args.force_state,
             freeze_planner=bool(args.freeze_planner),
             planner_temperature=args.planner_temperature,
+            lookahead_feedback_scale=args.lookahead_feedback_scale,
+            async_planner=not bool(args.no_async_planner),
             repetition_penalty=args.repetition_penalty,
             no_repeat_ngram_size=args.no_repeat_ngram_size,
         )

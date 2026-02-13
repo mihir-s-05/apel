@@ -11,7 +11,9 @@ data:
   streaming: true
 
 model:
+  version: v2_planner_required
   num_plan_states: 6
+  num_experts: 6
   chunk_size: 16
   token_dim: 192
   hidden_dim: 512
@@ -20,6 +22,9 @@ model:
   dropout: 0.1
   planner_context_scale: 1.0
   planner_self_bias: 1.8
+  lookahead_horizon: 2
+  lookahead_feedback_scale: 0.25
+  async_planner: true
 
 train:
   out_dir: runs/tinystories_selfbias_smoke
@@ -38,4 +43,3 @@ train:
   preview_tokens: 100
   entropy_reg_weight: 0.01
   usage_balance_weight: 0.2
-

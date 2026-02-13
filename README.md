@@ -28,14 +28,15 @@ What "exact filtering" means here:
 
 What "asynchronous lookahead" means here:
 
-1. While speaking, the model can repeatedly apply planner transition dynamics to predict likely future plan-state beliefs.
-2. These lookahead beliefs are available for introspection/debugging and future extensions.
+1. In `v2_planner_required`, while speaking, the model can repeatedly apply planner transition dynamics to predict likely future plan-state beliefs.
+2. In V2, those lookahead beliefs can be fed back into the emission gate (configurable blend) so planner forecasts influence current token choices.
+3. V2 generation can run a background planner worker so lookahead forecasting and token sampling overlap in wall-clock time.
 
-There are now two versioned architectures:
+There are two versioned architectures:
 
 1. `v1_filtered_mixture`:
    Original filtered-mixture planner/executor model.
-2. `v2_planner_required`:
+2. `v2_planner_required` (default for new training runs):
    Planner-required expert-head model where token logits are planner-gated expert mixtures (reducing planner bypass).
 
 See `docs/model_versions.md` for compatibility and version history.
@@ -117,18 +118,21 @@ Important knobs:
 12. `train.chunk_post_kl_weight`: chunk-posterior alignment weight (recognizer posterior vs filtered posterior).
 13. `train.save_interval`: optional periodic checkpoint save frequency (in steps).
 14. `train.resume_from`: optional checkpoint path to resume optimizer+model+global_step.
-15. `model.version`: architecture version (`v1_filtered_mixture` or `v2_planner_required`).
+15. `model.version`: architecture version (`v1_filtered_mixture` or `v2_planner_required`, default is V2 when unset).
 16. `train.precision`: `fp32`, `fp16`, or `bf16` (AMP used automatically on CUDA).
 17. `train.grad_accum_steps`: gradient accumulation factor for VRAM-constrained training.
 18. `train.loss_weights.*` (V2): planner-required objectives (`future_contrastive`, `plan_js_div`, `boundary_entropy`, `usage_balance`).
 19. `data.token_cache`: if `true`, builds/uses on-disk tokenized corpora (`.bin`) instead of holding full text in RAM.
-20. `data.token_cache_dir`: output directory for token cache files (default under `train.out_dir`).
-21. `data.max_train_tokens` / `data.max_val_tokens`: hard token caps for cache construction.
-22. `data.tokenizer_fit_max_examples` / `data.tokenizer_fit_max_chars`: bounded sample used to fit tokenizer in token-cache mode.
-23. `data.reuse_token_cache`: reuse previously built `.bin` files instead of rebuilding.
-24. `train.adaptive_batch.enabled`: enable VRAM-based auto batch probe.
-25. `train.adaptive_batch.probe_batch_size`: micro-batch used for memory probing.
-26. `train.adaptive_batch.reprobe_interval_steps`: periodically re-probe and update batch size mid-run.
+20. `model.lookahead_horizon` / `model.lookahead_feedback_scale` (V2): planner forecast horizon and planner-to-emission feedback strength.
+21. `model.async_planner` (V2): enable asynchronous planner forecasting thread during generation.
+22. `model.token_filtering` (V2): when `true`, planner beliefs are updated per token during generation; when `false`, planner updates happen at chunk boundaries only.
+23. `data.token_cache_dir`: output directory for token cache files (default under `train.out_dir`).
+24. `data.max_train_tokens` / `data.max_val_tokens`: hard token caps for cache construction.
+25. `data.tokenizer_fit_max_examples` / `data.tokenizer_fit_max_chars`: bounded sample used to fit tokenizer in token-cache mode.
+26. `data.reuse_token_cache`: reuse previously built `.bin` files instead of rebuilding.
+27. `train.adaptive_batch.enabled`: enable VRAM-based auto batch probe.
+28. `train.adaptive_batch.probe_batch_size`: micro-batch used for memory probing.
+29. `train.adaptive_batch.reprobe_interval_steps`: periodically re-probe and update batch size mid-run.
 
 ## Large-Scale Training
 
@@ -171,6 +175,8 @@ Common flags for `apelr.sample`:
 5. `--force-state`: force a planner state at inference (V2 only).
 6. `--freeze-planner`: disable planner updates during generation (V2 only).
 7. `--planner-temperature`: planner distribution sharpness during V2 generation.
+8. `--lookahead-feedback-scale`: override planner-to-emission feedback strength during sampling.
+9. `--no-async-planner`: disable background planner worker and run synchronous lookahead only.
 
 ## Data
 

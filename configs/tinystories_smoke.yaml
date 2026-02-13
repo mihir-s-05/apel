@@ -11,13 +11,18 @@ data:
   streaming: true
 
 model:
+  version: v2_planner_required
   num_plan_states: 6
+  num_experts: 6
   chunk_size: 16
   token_dim: 192
   hidden_dim: 512
   fusion_dim: 384
   num_layers: 2
   dropout: 0.1
+  lookahead_horizon: 2
+  lookahead_feedback_scale: 0.25
+  async_planner: true
 
 train:
   out_dir: runs/tinystories_smoke

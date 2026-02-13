@@ -239,7 +239,7 @@ def get_model_version(model_cfg: dict[str, Any], resume_ckpt: dict[str, Any] | N
         return str(model_cfg["architecture"])
     if resume_ckpt is not None:
         return str(resume_ckpt.get("model_version", MODEL_VERSION_V1))
-    return MODEL_VERSION_V1
+    return MODEL_VERSION_V2
 
 
 def instantiate_model(model_cfg: dict[str, Any], vocab_size: int, model_version: str) -> torch.nn.Module:
@@ -273,6 +273,10 @@ def instantiate_model(model_cfg: dict[str, Any], vocab_size: int, model_version:
                 planner_context_scale=float(model_cfg.get("planner_context_scale", 1.0)),
                 future_horizon_chunks=int(model_cfg.get("future_horizon_chunks", 2)),
                 planner_temperature=float(model_cfg.get("plan_temperature_start", model_cfg.get("plan_temperature", 1.0))),
+                token_filtering=bool(model_cfg.get("token_filtering", True)),
+                lookahead_horizon=int(model_cfg.get("lookahead_horizon", 2)),
+                lookahead_feedback_scale=float(model_cfg.get("lookahead_feedback_scale", 0.25)),
+                async_planner=bool(model_cfg.get("async_planner", True)),
             )
         )
     raise ValueError(f"Unsupported model version '{model_version}'.")
@@ -327,6 +331,9 @@ def evaluate_v2(
     device: torch.device,
     max_batches: int,
     rep_unlikelihood_window: int,
+    *,
+    commitment: str,
+    planner_temperature: float,
 ) -> dict[str, float]:
     model.eval()
     losses: list[float] = []
@@ -339,6 +346,9 @@ def evaluate_v2(
     force_divs: list[float] = []
     state_persist: list[float] = []
     expert_utils: list[float] = []
+    feedback_deltas: list[float] = []
+    lookahead_steps = int(model.cfg.lookahead_horizon)
+    lookahead_feedback_scale = float(model.cfg.lookahead_feedback_scale)
     with torch.no_grad():
         for i, (x, y) in enumerate(loader):
             if i >= max_batches:
@@ -349,16 +359,35 @@ def evaluate_v2(
                 x,
                 y,
                 planner_mode="normal",
-                commitment="soft",
+                commitment=commitment,
+                planner_temperature=planner_temperature,
+                lookahead_steps=lookahead_steps,
+                lookahead_feedback_scale=lookahead_feedback_scale,
                 rep_unlikelihood_window=rep_unlikelihood_window,
             )
-            diag = model.planner_usage_metrics(x, y)
+            nll_no_feedback, _ = model.compute_losses(
+                x,
+                y,
+                planner_mode="normal",
+                commitment=commitment,
+                planner_temperature=planner_temperature,
+                lookahead_steps=lookahead_steps,
+                lookahead_feedback_scale=0.0,
+                rep_unlikelihood_window=rep_unlikelihood_window,
+            )
+            diag = model.planner_usage_metrics(
+                x,
+                y,
+                commitment=commitment,
+                planner_temperature=planner_temperature,
+            )
             losses.append(float(nll.item()))
             usage_kls.append(float(aux["usage_kl_to_uniform"].item()))
             boundary_ents.append(float(aux["boundary_entropy"].item()))
             future_losses.append(float(aux["future_contrastive_loss"].item()))
             js_losses.append(float(aux["plan_js_div_loss"].item()))
             repu_losses.append(float(aux["rep_unlikelihood_loss"].item()))
+            feedback_deltas.append(float((nll_no_feedback - nll).item()))
             mask_deltas.append(float(diag["planner_mask_delta_loss"].item()))
             force_divs.append(float(diag["forced_state_divergence"].item()))
             state_persist.append(float(aux["state_persistence"].item()))
@@ -372,6 +401,7 @@ def evaluate_v2(
             "future_contrastive_loss": float("nan"),
             "plan_js_div_loss": float("nan"),
             "rep_unlikelihood_loss": float("nan"),
+            "feedback_delta_loss": float("nan"),
             "planner_mask_delta_loss": float("nan"),
             "forced_state_divergence": float("nan"),
             "state_persistence": float("nan"),
@@ -386,6 +416,7 @@ def evaluate_v2(
         "future_contrastive_loss": float(np.mean(future_losses)),
         "plan_js_div_loss": float(np.mean(js_losses)),
         "rep_unlikelihood_loss": float(np.mean(repu_losses)),
+        "feedback_delta_loss": float(np.mean(feedback_deltas)),
         "planner_mask_delta_loss": float(np.mean(mask_deltas)),
         "forced_state_divergence": float(np.mean(force_divs)),
         "state_persistence": float(np.mean(state_persist)),
@@ -400,10 +431,21 @@ def evaluate_model(
     device: torch.device,
     max_batches: int,
     rep_unlikelihood_window: int = 0,
+    *,
+    v2_commitment: str = "soft",
+    v2_planner_temperature: float = 1.0,
 ) -> dict[str, float]:
     if model_version == MODEL_VERSION_V1:
         return evaluate_v1(model, loader, device, max_batches)
-    return evaluate_v2(model, loader, device, max_batches, rep_unlikelihood_window)
+    return evaluate_v2(
+        model,
+        loader,
+        device,
+        max_batches,
+        rep_unlikelihood_window,
+        commitment=v2_commitment,
+        planner_temperature=v2_planner_temperature,
+    )
 
 
 def prepare_tokens(tokenizer: TokenizerLike, text: str) -> list[int]:
@@ -762,6 +804,28 @@ def main() -> None:
     v2_commitment_warmup_steps = int(model_cfg.get("commitment_warmup_steps", 0))
     v2_plan_temperature_start = float(model_cfg.get("plan_temperature_start", model_cfg.get("plan_temperature", 1.0)))
     v2_plan_temperature_end = float(model_cfg.get("plan_temperature_end", v2_plan_temperature_start))
+    if model_version == MODEL_VERSION_V2:
+        if v2_commitment not in {"soft", "gumbel_st"}:
+            raise ValueError("model.plan_commitment must be 'soft' or 'gumbel_st' for V2.")
+        planner_core_weights = {
+            "future_contrastive": v2_future_weight,
+            "plan_js_div": v2_js_weight,
+            "boundary_entropy": v2_boundary_entropy_weight,
+            "usage_balance": v2_usage_weight,
+        }
+        if all(abs(w) <= 1e-12 for w in planner_core_weights.values()):
+            if bool(train_cfg.get("allow_zero_v2_planner_losses", False)):
+                print(
+                    "Warning: all core V2 planner loss weights are zero. "
+                    "Planner-required coupling may collapse to weak/degenerate behavior."
+                )
+            else:
+                raise ValueError(
+                    "All core V2 planner loss weights are zero. "
+                    "Set at least one of train.loss_weights.{future_contrastive, plan_js_div, "
+                    "boundary_entropy, usage_balance} > 0, or set "
+                    "train.allow_zero_v2_planner_losses=true to override."
+                )
 
     grad_accum_steps = int(train_cfg.get("grad_accum_steps", 1))
     precision = str(train_cfg.get("precision", "fp16" if device.type == "cuda" else "fp32")).lower()
@@ -987,6 +1051,16 @@ def main() -> None:
                     )
 
             if global_step % eval_interval == 0 or global_step == max_steps:
+                eval_commitment = "soft"
+                eval_plan_temp = 1.0
+                if model_version == MODEL_VERSION_V2:
+                    eval_progress_frac = float(global_step) / float(max(max_steps - 1, 1))
+                    eval_plan_temp = lerp(v2_plan_temperature_start, v2_plan_temperature_end, eval_progress_frac)
+                    eval_commitment = (
+                        "soft"
+                        if (v2_commitment == "gumbel_st" and global_step < v2_commitment_warmup_steps)
+                        else v2_commitment
+                    )
                 eval_metrics = evaluate_model(
                     model,
                     model_version,
@@ -994,6 +1068,8 @@ def main() -> None:
                     device,
                     max_batches=val_batches,
                     rep_unlikelihood_window=v2_rep_unlikelihood_window,
+                    v2_commitment=eval_commitment,
+                    v2_planner_temperature=eval_plan_temp,
                 )
                 if model_version == MODEL_VERSION_V1:
                     print(
@@ -1016,6 +1092,7 @@ def main() -> None:
                         f"fcl={eval_metrics['future_contrastive_loss']:.3f} "
                         f"js={eval_metrics['plan_js_div_loss']:.3f} "
                         f"repu={eval_metrics['rep_unlikelihood_loss']:.3f} "
+                        f"fb_d={eval_metrics['feedback_delta_loss']:.3f} "
                         f"mask_d={eval_metrics['planner_mask_delta_loss']:.3f} "
                         f"force_js={eval_metrics['forced_state_divergence']:.3f} "
                         f"sp={eval_metrics['state_persistence']:.3f} "
@@ -1072,6 +1149,16 @@ def main() -> None:
         device,
         max_batches=val_batches,
         rep_unlikelihood_window=v2_rep_unlikelihood_window,
+        v2_commitment=(
+            "soft"
+            if (model_version == MODEL_VERSION_V2 and v2_commitment == "gumbel_st" and global_step < v2_commitment_warmup_steps)
+            else v2_commitment
+        ),
+        v2_planner_temperature=lerp(
+            v2_plan_temperature_start,
+            v2_plan_temperature_end,
+            float(global_step) / float(max(max_steps - 1, 1)),
+        ),
     )
     (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     if model_version == MODEL_VERSION_V2:
@@ -1080,6 +1167,9 @@ def main() -> None:
             "forced_state_divergence": metrics.get("forced_state_divergence"),
             "state_persistence": metrics.get("state_persistence"),
             "expert_utilization": metrics.get("expert_utilization"),
+            "future_contrastive_loss": metrics.get("future_contrastive_loss"),
+            "plan_js_div_loss": metrics.get("plan_js_div_loss"),
+            "feedback_delta_loss": metrics.get("feedback_delta_loss"),
         }
         (out_dir / "planner_eval.json").write_text(json.dumps(planner_eval, indent=2), encoding="utf-8")
     print(f"Saved checkpoint to: {ckpt_path}")
