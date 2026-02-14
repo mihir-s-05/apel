@@ -90,7 +90,7 @@ uv run --python .venv\Scripts\python.exe python -m unittest discover -s tests -p
 
 ## Standard Benchmarks
 
-This repo includes a lightweight, dependency-free (beyond `datasets`) subset of the EleutherAI LM Evaluation Harness-style benchmarks, aligned with the benchmark set used in the Titans paper (WikiText + common multiple-choice datasets).
+This repo includes a lightweight, dependency-free (beyond `datasets`) subset of the EleutherAI LM Evaluation Harness-style benchmarks, aligned with the benchmark set used in the Titans paper (WikiText + common multiple-choice datasets, including PIQA and SocialIQA).
 
 Run evals for one or more checkpoints:
 

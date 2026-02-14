@@ -353,6 +353,101 @@ def eval_lambada_openai(
 
 
 @torch.inference_mode()
+def eval_piqa(
+    *,
+    model: torch.nn.Module,
+    model_version: str,
+    tokenizer: TokenizerLike,
+    settings: EvalSettings,
+) -> dict[str, float]:
+    # lm-eval-harness piqa.yaml:
+    # doc_to_text: "Question: {{goal}}\nAnswer:"
+    # doc_to_choice: [sol1, sol2]
+    ds = load_dataset("piqa", split="validation", trust_remote_code=True)
+    upper = min(len(ds), int(settings.max_examples))
+    correct = 0
+    correct_norm = 0
+    gold_nll_sum: list[float] = []
+    gold_nll_mean: list[float] = []
+
+    for i in range(upper):
+        ex = ds[i]
+        prompt = f"Question: {ex['goal']}\nAnswer:"
+        choices = [str(ex["sol1"]), str(ex["sol2"])]
+        gold = int(ex["label"])
+        scores_sum, scores_mean = _score_choices(
+            model=model,
+            model_version=model_version,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            choices=choices,
+            settings=settings,
+        )
+        pred = _acc_from_scores(scores_sum)
+        pred_norm = _acc_from_scores(scores_mean)
+        correct += int(pred == gold)
+        correct_norm += int(pred_norm == gold)
+        gold_nll_sum.append(float(scores_sum[gold]))
+        gold_nll_mean.append(float(scores_mean[gold]))
+
+    return {
+        "acc": float(correct) / float(max(upper, 1)),
+        "acc_norm": float(correct_norm) / float(max(upper, 1)),
+        "gold_nll_sum": _mean(gold_nll_sum),
+        "gold_nll_mean": _mean(gold_nll_mean),
+        "examples": float(upper),
+    }
+
+
+@torch.inference_mode()
+def eval_social_iqa(
+    *,
+    model: torch.nn.Module,
+    model_version: str,
+    tokenizer: TokenizerLike,
+    settings: EvalSettings,
+) -> dict[str, float]:
+    # lm-eval-harness siqa.yaml:
+    # doc_to_text: "Q: {{context}} {{question}}\nA:"
+    # doc_to_choice: [answerA, answerB, answerC]
+    # doc_to_target: label-1, target_delimiter: " "
+    ds = load_dataset("social_i_qa", split="validation", trust_remote_code=True)
+    upper = min(len(ds), int(settings.max_examples))
+    correct = 0
+    correct_norm = 0
+    gold_nll_sum: list[float] = []
+    gold_nll_mean: list[float] = []
+
+    for i in range(upper):
+        ex = ds[i]
+        prompt = f"Q: {ex['context']} {ex['question']}\nA:"
+        choices = [f" {ex['answerA']}", f" {ex['answerB']}", f" {ex['answerC']}"]
+        gold = int(ex["label"]) - 1
+        scores_sum, scores_mean = _score_choices(
+            model=model,
+            model_version=model_version,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            choices=choices,
+            settings=settings,
+        )
+        pred = _acc_from_scores(scores_sum)
+        pred_norm = _acc_from_scores(scores_mean)
+        correct += int(pred == gold)
+        correct_norm += int(pred_norm == gold)
+        gold_nll_sum.append(float(scores_sum[gold]))
+        gold_nll_mean.append(float(scores_mean[gold]))
+
+    return {
+        "acc": float(correct) / float(max(upper, 1)),
+        "acc_norm": float(correct_norm) / float(max(upper, 1)),
+        "gold_nll_sum": _mean(gold_nll_sum),
+        "gold_nll_mean": _mean(gold_nll_mean),
+        "examples": float(upper),
+    }
+
+
+@torch.inference_mode()
 def eval_hellaswag(
     *,
     model: torch.nn.Module,
@@ -620,10 +715,12 @@ def _expand_tasks(tasks: str) -> list[str]:
             "wikitext2",
             "wikitext103",
             "lambada_openai",
+            "piqa",
             "hellaswag",
             "arc_easy",
             "arc_challenge",
             "winogrande_xl",
+            "social_iqa",
             "openbookqa",
             "boolq",
         ]
@@ -679,6 +776,10 @@ def main() -> None:
                 run["metrics"][task] = eval_lambada_openai(
                     model=model, model_version=model_version, tokenizer=tokenizer, settings=settings
                 )
+            elif task == "piqa":
+                run["metrics"][task] = eval_piqa(
+                    model=model, model_version=model_version, tokenizer=tokenizer, settings=settings
+                )
             elif task == "hellaswag":
                 run["metrics"][task] = eval_hellaswag(
                     model=model, model_version=model_version, tokenizer=tokenizer, settings=settings
@@ -693,6 +794,10 @@ def main() -> None:
                 )
             elif task == "winogrande_xl":
                 run["metrics"][task] = eval_winogrande_xl(
+                    model=model, model_version=model_version, tokenizer=tokenizer, settings=settings
+                )
+            elif task == "social_iqa":
+                run["metrics"][task] = eval_social_iqa(
                     model=model, model_version=model_version, tokenizer=tokenizer, settings=settings
                 )
             elif task == "openbookqa":
