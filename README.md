@@ -88,6 +88,29 @@ uv run --python .venv\Scripts\python.exe python -m apelr.sample --checkpoint run
 uv run --python .venv\Scripts\python.exe python -m unittest discover -s tests -p "test_*.py"
 ```
 
+## Standard Benchmarks
+
+This repo includes a lightweight, dependency-free (beyond `datasets`) subset of the EleutherAI LM Evaluation Harness-style benchmarks, aligned with the benchmark set used in the Titans paper (WikiText + common multiple-choice datasets).
+
+Run evals for one or more checkpoints:
+
+```powershell
+uv run --python .venv\Scripts\python.exe python -m apelr.eval_standard `
+  --checkpoints runs\wikitext2_v2_cuda_4070m_bpe2048_smoke\checkpoint.pt `
+  --tasks titans --max-examples 512 --max-input-len 96
+```
+
+Compare APEL-R to a decoder-only Transformer baseline:
+
+```powershell
+uv run --python .venv\Scripts\python.exe python -m apelr.eval_standard `
+  --checkpoints `
+    runs\wikitext2_v2_cuda_4070m_bpe2048_smoke\checkpoint.pt `
+    runs\wikitext2_transformer_cuda_4070m_bpe2048_smoke\checkpoint.pt `
+  --tasks wikitext2,lambada_openai,hellaswag,arc_easy,arc_challenge,winogrande_xl,openbookqa,boolq `
+  --max-examples 256 --max-input-len 96 --output runs\eval_compare.json
+```
+
 ## Config Guide
 
 Useful configs:

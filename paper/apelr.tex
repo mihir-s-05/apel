@@ -84,6 +84,48 @@ We use \APEL{} as the conceptual model class and \APELR{} as the implemented pro
   \item We present preliminary empirical results and ablations on TinyStories and WikiText-2, including intervention-based planner diagnostics and controlled toggles for token filtering and lookahead feedback (\Cref{sec:experiments}).
 \end{enumerate}
 
+\begin{figure}[t]
+\centering
+\resizebox{0.92\linewidth}{!}{%
+\begin{tikzpicture}[
+  node distance=7mm,
+  box/.style={draw, rounded corners, align=center, text width=24mm, minimum height=7mm, inner sep=2pt},
+  smallbox/.style={draw, rounded corners, align=center, text width=23mm, minimum height=6mm, inner sep=2pt},
+  arrow/.style={-Latex, thick},
+  every node/.style={font=\small},
+]
+  \node[box] (tokens) {Tokens\\$y_{\le t}$};
+  \node[box, right=of tokens] (gru) {Executor\\GRU\\$h_t$};
+  \node[box, right=of gru] (experts) {Expert heads\\$p_k(\cdot\mid h_t)$};
+
+  \node[smallbox, below=of gru, xshift=7mm] (belief) {Planner belief\\$\B_t\in\Delta^{K-1}$};
+  \node[smallbox, right=of belief] (gate) {Gate\\$g_t$};
+
+  \node[smallbox, below=of gate] (lookahead) {Lookahead\\$\bar{\B}_t=\frac{1}{H}\sum_{s=1}^H \B_tP^s$\\(async)};
+  \node[smallbox, left=of lookahead] (transition) {Transition\\$P$};
+
+  \node[box, right=of experts, xshift=3mm] (mix) {Mixture\\$p(y_{t+1})$\\$=\sum_k g_t(k)p_k$};
+  \node[box, right=of mix] (sample) {Sample\\$y_{t+1}$};
+
+  \draw[arrow] (tokens) -- (gru);
+  \draw[arrow] (gru) -- (experts);
+  \draw[arrow] (experts) -- (mix);
+  \draw[arrow] (gate) -- (mix);
+  \draw[arrow] (mix) -- (sample);
+
+  \draw[arrow] (sample) |- node[pos=0.25, right, align=left, font=\small] {token filtering\\update $\B_{t+1}$} (belief);
+  \draw[arrow] (gru) -- node[midway, right, font=\small] {chunk summary $s_c$} (belief);
+  \draw[arrow] (belief) -- (gate);
+  \draw[arrow] (transition) -- (belief);
+  \draw[arrow] (transition) -- (lookahead);
+  \draw[arrow] (belief) -- (lookahead);
+  \draw[arrow] (lookahead) -- node[midway, right, font=\small] {feedback $\lambda$} (gate);
+\end{tikzpicture}%
+}
+\caption{Schematic of \APELR{} V2. The executor produces hidden states; experts produce state-conditional token distributions; the planner maintains an online belief over discrete plan states; optional lookahead forecasting can be computed asynchronously and fed back into the gating distribution.}
+\label{fig:apelr-v2-schematic}
+\end{figure}
+
 \section{Background and Motivation}
 \label{sec:background}
 \subsection{Why chunk-level planning?}
@@ -729,47 +771,5 @@ The prototype also exposes key tradeoffs (collapse vs. degenerate specialization
 
 \bibliographystyle{plainnat}
 \bibliography{references}
-
-\appendix
-\section{Architecture Diagram}
-\label{app:diagram}
-
-\begin{figure}[h]
-\centering
-\begin{tikzpicture}[
-  node distance=10mm,
-  box/.style={draw, rounded corners, align=center, minimum width=30mm, minimum height=8mm},
-  smallbox/.style={draw, rounded corners, align=center, minimum width=28mm, minimum height=7mm},
-  arrow/.style={-Latex, thick},
-]
-  \node[box] (tokens) {Tokens\\$y_{\le t}$};
-  \node[box, right=of tokens] (gru) {Executor\\GRU backbone\\$h_t$};
-  \node[box, right=of gru] (experts) {Expert heads\\$p_k(\cdot\mid h_t)$};
-
-  \node[smallbox, below=of gru, xshift=10mm] (belief) {Planner belief\\$\B_t\in\Delta^{K-1}$};
-  \node[smallbox, right=of belief] (gate) {Gate\\$g_t$};
-
-  \node[smallbox, below=of gate] (lookahead) {Lookahead\\$\bar{\B}_t=\frac{1}{H}\sum_{s=1}^H \B_tP^s$\\(async)};
-  \node[smallbox, left=of lookahead] (transition) {Transition\\$P$};
-
-  \node[box, right=of experts, xshift=5mm] (mix) {Mixture\\$p(y_{t+1})=\sum_k g_t(k)p_k$};
-  \node[box, right=of mix] (sample) {Sample\\$y_{t+1}$};
-
-  \draw[arrow] (tokens) -- (gru);
-  \draw[arrow] (gru) -- (experts);
-  \draw[arrow] (experts) -- (mix);
-  \draw[arrow] (gate) -- (mix);
-  \draw[arrow] (mix) -- (sample);
-
-  \draw[arrow] (sample) |- node[pos=0.25, right, align=left, font=\small] {token filtering\\update $\B_{t+1}$} (belief);
-  \draw[arrow] (gru) -- node[midway, right, font=\small] {chunk summary $s_c$} (belief);
-  \draw[arrow] (belief) -- (gate);
-  \draw[arrow] (transition) -- (belief);
-  \draw[arrow] (transition) -- (lookahead);
-  \draw[arrow] (belief) -- (lookahead);
-  \draw[arrow] (lookahead) -- node[midway, right, font=\small] {feedback $\lambda$} (gate);
-\end{tikzpicture}
-\caption{Schematic of \APELR{} V2. The executor produces hidden states; experts produce state-conditional token distributions; the planner maintains an online belief over discrete plan states; optional lookahead forecasting can be computed asynchronously and fed back into the gating distribution.}
-\end{figure}
 
 \end{document}

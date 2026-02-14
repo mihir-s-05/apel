@@ -26,6 +26,7 @@ from .data import (
 )
 from .model import APELRModel, APELRModelConfig
 from .model_v2 import APELRV2Model, APELRV2ModelConfig
+from .transformer_lm import TransformerLM, TransformerLMConfig
 from .tokenizer import (
     BPETokenizer,
     CharTokenizer,
@@ -36,6 +37,7 @@ from .tokenizer import (
 
 MODEL_VERSION_V1 = "v1_filtered_mixture"
 MODEL_VERSION_V2 = "v2_planner_required"
+MODEL_VERSION_TRANSFORMER = "transformer_lm"
 CONFIG_SCHEMA_VERSION = 2
 
 
@@ -186,7 +188,7 @@ def resolve_batch_size(
                     - loss_weights["plan_mi"] * aux["plan_mi"]
                     + loss_weights["chunk_post_kl"] * aux["chunk_post_kl"]
                 )
-            else:
+            elif model_version == MODEL_VERSION_V2:
                 nll, aux = model.compute_losses(
                     x,
                     y,
@@ -203,6 +205,11 @@ def resolve_batch_size(
                     - loss_weights["v2_js"] * aux["plan_js_div_loss"]
                     + loss_weights["v2_rep_unlikelihood"] * aux["rep_unlikelihood_loss"]
                 )
+            elif model_version == MODEL_VERSION_TRANSFORMER:
+                nll = model.nll(x, y)
+                loss = nll
+            else:
+                raise ValueError(f"Unsupported model version '{model_version}'.")
         loss.backward()
         torch.cuda.synchronize(device_index)
         peak = torch.cuda.max_memory_allocated(device_index)
@@ -277,6 +284,18 @@ def instantiate_model(model_cfg: dict[str, Any], vocab_size: int, model_version:
                 lookahead_horizon=int(model_cfg.get("lookahead_horizon", 2)),
                 lookahead_feedback_scale=float(model_cfg.get("lookahead_feedback_scale", 0.25)),
                 async_planner=bool(model_cfg.get("async_planner", True)),
+            )
+        )
+    if model_version == MODEL_VERSION_TRANSFORMER:
+        return TransformerLM(
+            TransformerLMConfig(
+                vocab_size=vocab_size,
+                max_seq_len=int(model_cfg.get("max_seq_len", 1024)),
+                d_model=int(model_cfg.get("d_model", model_cfg.get("hidden_dim", 512))),
+                n_layers=int(model_cfg.get("n_layers", model_cfg.get("num_layers", 6))),
+                n_heads=int(model_cfg.get("n_heads", 8)),
+                d_ff=(int(model_cfg["d_ff"]) if model_cfg.get("d_ff") is not None else None),
+                dropout=float(model_cfg.get("dropout", 0.1)),
             )
         )
     raise ValueError(f"Unsupported model version '{model_version}'.")
@@ -437,15 +456,33 @@ def evaluate_model(
 ) -> dict[str, float]:
     if model_version == MODEL_VERSION_V1:
         return evaluate_v1(model, loader, device, max_batches)
-    return evaluate_v2(
-        model,
-        loader,
-        device,
-        max_batches,
-        rep_unlikelihood_window,
-        commitment=v2_commitment,
-        planner_temperature=v2_planner_temperature,
-    )
+    if model_version == MODEL_VERSION_V2:
+        return evaluate_v2(
+            model,
+            loader,
+            device,
+            max_batches,
+            rep_unlikelihood_window,
+            commitment=v2_commitment,
+            planner_temperature=v2_planner_temperature,
+        )
+    # Baseline decoder-only Transformer LM.
+    if model_version == MODEL_VERSION_TRANSFORMER:
+        model.eval()
+        losses: list[float] = []
+        with torch.no_grad():
+            for i, (x, y) in enumerate(loader):
+                if i >= max_batches:
+                    break
+                x = x.to(device)
+                y = y.to(device)
+                loss = model.nll(x, y)
+                losses.append(float(loss.item()))
+        if not losses:
+            return {"loss": float("nan"), "ppl": float("nan")}
+        mean_loss = float(np.mean(losses))
+        return {"loss": mean_loss, "ppl": float(math.exp(min(mean_loss, 20.0)))}
+    raise ValueError(f"Unsupported model version '{model_version}'.")
 
 
 def prepare_tokens(tokenizer: TokenizerLike, text: str) -> list[int]:
@@ -505,7 +542,7 @@ def maybe_sample_preview(
             repetition_penalty=1.05,
             no_repeat_ngram_size=3,
         )
-    else:
+    elif model_version == MODEL_VERSION_V2:
         sample_ids, _ = model.generate_planned(
             prompt_ids=prompt_ids,
             max_new_tokens=max_new_tokens,
@@ -518,6 +555,19 @@ def maybe_sample_preview(
             repetition_penalty=1.05,
             no_repeat_ngram_size=3,
         )
+    elif model_version == MODEL_VERSION_TRANSFORMER:
+        sample_ids = model.generate(
+            prompt_ids=prompt_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=0.9,
+            top_k=40,
+            top_p=0.95,
+            eos_id=tokenizer.eos_id,
+            repetition_penalty=1.05,
+            no_repeat_ngram_size=3,
+        )
+    else:
+        raise ValueError(f"Unsupported model version '{model_version}'.")
     return tokenizer.decode(sample_ids)
 
 
@@ -942,7 +992,7 @@ def main() -> None:
                         - plan_mi_weight * aux["plan_mi"]
                         + chunk_post_kl_weight * aux["chunk_post_kl"]
                     )
-                else:
+                elif model_version == MODEL_VERSION_V2:
                     progress_frac = float(global_step) / float(max(max_steps - 1, 1))
                     current_plan_temp = lerp(v2_plan_temperature_start, v2_plan_temperature_end, progress_frac)
                     current_commitment = (
@@ -968,6 +1018,15 @@ def main() -> None:
                         - v2_js_weight * aux["plan_js_div_loss"]
                         + v2_rep_unlikelihood_weight * aux["rep_unlikelihood_loss"]
                     )
+                elif model_version == MODEL_VERSION_TRANSFORMER:
+                    nll = model.nll(x, y)
+                    aux = {}
+                    current_plan_temp = 1.0
+                    chunk_warm = 1.0
+                    effective_chunk_bow_weight = 0.0
+                    loss = nll
+                else:
+                    raise ValueError(f"Unsupported model version '{model_version}'.")
 
                 loss_for_backward = loss / float(max(grad_accum_steps, 1))
 
@@ -1034,7 +1093,7 @@ def main() -> None:
                         cpk=f"{aux['chunk_post_kl'].item():.3f}",
                         tok_s=f"{tok_per_s:.0f}",
                     )
-                else:
+                elif model_version == MODEL_VERSION_V2:
                     progress.set_postfix(
                         loss=f"{loss.item():.4f}",
                         ppl=f"{math.exp(min(nll.item(), 20.0)):.2f}",
@@ -1049,6 +1108,15 @@ def main() -> None:
                         lr=f"{current_lr:.2e}",
                         tok_s=f"{tok_per_s:.0f}",
                     )
+                elif model_version == MODEL_VERSION_TRANSFORMER:
+                    progress.set_postfix(
+                        loss=f"{loss.item():.4f}",
+                        ppl=f"{math.exp(min(nll.item(), 20.0)):.2f}",
+                        lr=f"{current_lr:.2e}",
+                        tok_s=f"{tok_per_s:.0f}",
+                    )
+                else:
+                    raise ValueError(f"Unsupported model version '{model_version}'.")
 
             if global_step % eval_interval == 0 or global_step == max_steps:
                 eval_commitment = "soft"
@@ -1082,7 +1150,7 @@ def main() -> None:
                         f"plan_mi={eval_metrics['plan_mi']:.3f} "
                         f"chunk_post_kl={eval_metrics['chunk_post_kl']:.3f}"
                     )
-                else:
+                elif model_version == MODEL_VERSION_V2:
                     print(
                         f"\n[eval step {global_step}] "
                         f"val_loss={eval_metrics['loss']:.4f} "
@@ -1098,6 +1166,14 @@ def main() -> None:
                         f"sp={eval_metrics['state_persistence']:.3f} "
                         f"eu={eval_metrics['expert_utilization']:.3f}"
                     )
+                elif model_version == MODEL_VERSION_TRANSFORMER:
+                    print(
+                        f"\n[eval step {global_step}] "
+                        f"val_loss={eval_metrics['loss']:.4f} "
+                        f"val_ppl={eval_metrics['ppl']:.2f}"
+                    )
+                else:
+                    raise ValueError(f"Unsupported model version '{model_version}'.")
                 model.train()
 
             if global_step % preview_interval == 0 or global_step == max_steps:

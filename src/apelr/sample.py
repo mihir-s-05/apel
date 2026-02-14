@@ -7,10 +7,12 @@ import torch
 
 from .model import APELRModel, APELRModelConfig
 from .model_v2 import APELRV2Model, APELRV2ModelConfig
+from .transformer_lm import TransformerLM, TransformerLMConfig
 from .tokenizer import load_tokenizer
 
 MODEL_VERSION_V1 = "v1_filtered_mixture"
 MODEL_VERSION_V2 = "v2_planner_required"
+MODEL_VERSION_TRANSFORMER = "transformer_lm"
 
 
 def main() -> None:
@@ -40,6 +42,9 @@ def main() -> None:
     elif model_version == MODEL_VERSION_V2:
         model_cfg = APELRV2ModelConfig(**ckpt["model_config"])
         model = APELRV2Model(model_cfg)
+    elif model_version == MODEL_VERSION_TRANSFORMER:
+        model_cfg = TransformerLMConfig(**ckpt["model_config"])
+        model = TransformerLM(model_cfg)
     else:
         raise ValueError(f"Unsupported model_version '{model_version}' in checkpoint.")
 
@@ -75,7 +80,7 @@ def main() -> None:
             repetition_penalty=args.repetition_penalty,
             no_repeat_ngram_size=args.no_repeat_ngram_size,
         )
-    else:
+    elif model_version == MODEL_VERSION_V2:
         out_ids, lookahead = model.generate_planned(
             prompt_ids=prompt_ids,
             max_new_tokens=args.max_new_tokens,
@@ -92,6 +97,20 @@ def main() -> None:
             repetition_penalty=args.repetition_penalty,
             no_repeat_ngram_size=args.no_repeat_ngram_size,
         )
+    elif model_version == MODEL_VERSION_TRANSFORMER:
+        out_ids = model.generate(
+            prompt_ids=prompt_ids,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            eos_id=tokenizer.eos_id,
+            repetition_penalty=args.repetition_penalty,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
+        )
+        lookahead = []
+    else:
+        raise ValueError(f"Unsupported model_version '{model_version}' in checkpoint.")
     text = tokenizer.decode(out_ids)
     print(text)
     if lookahead:

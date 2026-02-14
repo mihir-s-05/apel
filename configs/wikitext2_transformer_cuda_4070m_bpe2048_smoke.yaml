@@ -1,0 +1,58 @@
+seed: 42
+device: cuda
+
+data:
+  source: wikitext2
+  train_split: train
+  val_split: validation
+  max_train_examples: 30000
+  max_val_examples: 3500
+  min_chars: 16
+  streaming: false
+
+tokenizer:
+  type: bpe
+  vocab_size: 2048
+  min_frequency: 2
+  byte_level: true
+  lowercase: false
+  special_tokens: ["<pad>", "<bos>", "<eos>", "<unk>"]
+
+model:
+  version: transformer_lm
+  max_seq_len: 96
+  d_model: 768
+  n_layers: 2
+  n_heads: 8
+  dropout: 0.1
+
+train:
+  out_dir: runs/wikitext2_transformer_cuda_4070m_bpe2048_smoke
+  seq_len: 96
+  stride: 96
+  batch_size: auto
+  adaptive_batch:
+    enabled: true
+    probe_batch_size: 1
+    min_batch_size: 1
+    max_batch_size: 8
+    safety_factor: 0.9
+  grad_accum_steps: 2
+  precision: fp16
+  lr: 0.00055
+  lr_schedule: cosine
+  warmup_steps: 20
+  min_lr_ratio: 0.2
+  weight_decay: 0.01
+  grad_clip: 1.0
+  max_steps: 80
+  log_interval: 10
+  eval_interval: 40
+  val_batches: 20
+  preview_interval: 40
+  preview_prompt: "The meaning of life is"
+  preview_tokens: 140
+  save_interval: 40
+  pin_memory: true
+  num_workers: 0
+
