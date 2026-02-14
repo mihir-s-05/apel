@@ -1,0 +1,49 @@
+seed: 0
+device: cpu
+
+data:
+  source: tinystories
+  train_split: train
+  val_split: validation
+  max_train_examples: 200
+  max_val_examples: 50
+  min_chars: 16
+  streaming: true
+
+model:
+  version: v2_planner_required
+  num_plan_states: 4
+  num_experts: 4
+  chunk_size: 8
+  token_dim: 64
+  hidden_dim: 128
+  num_layers: 1
+  dropout: 0.0
+  token_filtering: true
+  lookahead_horizon: 2
+  lookahead_feedback_scale: 0.25
+  async_planner: false
+
+train:
+  out_dir: runs/tinystories_v2_quick
+  seq_len: 64
+  stride: 64
+  batch_size: 4
+  lr: 0.001
+  weight_decay: 0.01
+  grad_clip: 1.0
+  max_steps: 5
+  log_interval: 1
+  eval_interval: 5
+  val_batches: 1
+  preview_interval: 5
+  preview_prompt: "Once upon a time"
+  preview_tokens: 40
+  entropy_reg_weight: 0.01
+  usage_balance_weight: 0.1
+  loss_weights:
+    boundary_entropy: 0.05
+    usage_balance: 0.1
+    plan_js_div: 0.05
+    future_contrastive: 0.1
+

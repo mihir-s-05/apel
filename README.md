@@ -1,6 +1,6 @@
 # APEL-R PyTorch Prototype
 
-APEL-R is a language-model prototype built around a simple idea: while the model is producing text, it also keeps a running belief about a higher-level "plan" for the current chunk of text and can project that plan forward.
+APEL-R is a language-model prototype built around a simple idea: while the model is producing text, it also maintains an internal planner state (a small discrete distribution) and can project that state forward.
 
 This repo gives you a runnable end-to-end implementation for training and sampling.
 
@@ -12,7 +12,7 @@ APEL-R has two cooperating parts.
    It is the token generator. It reads previous tokens and predicts the next token.
 
 2. Planner:
-   It keeps a probability distribution over a small set of latent plan states (discrete states like hidden "intent modes") and updates that belief as tokens are observed.
+   It keeps a probability distribution over a small set of internal plan states (discrete modes like "intent/style") and updates that state online from the tokens it has actually seen/generated.
 
 Generation is chunked.
 
@@ -20,11 +20,11 @@ Generation is chunked.
 2. Inside a chunk, the model maintains a belief over the current latent plan state.
 3. At chunk boundaries, planner transition dynamics move belief into the next chunk's prior.
 
-What "exact filtering" means here:
+What "token filtering" means here (state-space policy LM):
 
 1. For each token, the model computes a mixture over plan states.
-2. After the token is chosen/observed, it performs a Bayes-style posterior update over plan states.
-3. This keeps planner belief mathematically consistent with generated text for the discrete-latent setup implemented here.
+2. After the next token is chosen/observed, it updates the planner state using the experts' token log-likelihoods (a filtering-like online update).
+3. This is a causal internal state update that keeps the planner state coupled to the realized token sequence; it is not a claim of recovering an exact posterior over a "true" latent variable.
 
 What "asynchronous lookahead" means here:
 
@@ -60,18 +60,13 @@ CUDA install (recommended for RTX 4070):
 
 ```powershell
 uv venv .venv
-uv pip install --python .venv\Scripts\python.exe torch --index-url https://download.pytorch.org/whl/cu124
-uv pip install --python .venv\Scripts\python.exe -e .
+uv sync
 ```
 
 For A100/H100, use the CUDA build and set `train.precision: bf16` in your config.
 
-CPU-only install:
-
-```powershell
-uv venv .venv
-uv pip install --python .venv\Scripts\python.exe -e .
-```
+Note: this repo pins a CUDA-enabled PyTorch wheel (`torch==2.6.0+cu124`). For CPU-only installs,
+change the `torch` dependency in `pyproject.toml` and re-lock (`uv lock`) before syncing.
 
 ## Quick Start
 
@@ -85,6 +80,12 @@ Sample:
 
 ```powershell
 uv run --python .venv\Scripts\python.exe python -m apelr.sample --checkpoint runs\tinystories_smoke\checkpoint.pt --prompt "Once upon a time"
+```
+
+## Tests
+
+```powershell
+uv run --python .venv\Scripts\python.exe python -m unittest discover -s tests -p "test_*.py"
 ```
 
 ## Config Guide
@@ -110,12 +111,12 @@ Important knobs:
 4. `model.planner_self_bias`: initial preference for staying in same plan state.
 5. `tokenizer.type`: `char` or `bpe`.
 6. `tokenizer.vocab_size`: BPE vocabulary size when `tokenizer.type: bpe`.
-7. `train.entropy_reg_weight`: regularization on belief entropy.
-8. `train.usage_balance_weight`: regularization for plan-state usage balance.
+7. `train.entropy_reg_weight`: (V1) regularization on belief entropy; (V2) fallback for `train.loss_weights.boundary_entropy` if unset.
+8. `train.usage_balance_weight`: (V1) regularization for plan-state usage balance; (V2) fallback for `train.loss_weights.usage_balance` if unset.
 9. `train.chunk_bow_weight`: chunk-level plan-predictive bag-of-words loss for stronger plan identifiability.
 10. `train.chunk_bow_warmup_steps`: optional warmup for `chunk_bow_weight` to avoid overwhelming NLL early.
 11. `train.plan_mi_weight`: weight for mutual-information surrogate that increases plan-state emission separability.
-12. `train.chunk_post_kl_weight`: chunk-posterior alignment weight (recognizer posterior vs filtered posterior).
+12. `train.chunk_post_kl_weight`: chunk-level state alignment weight (recognizer distribution vs online-filtered distribution).
 13. `train.save_interval`: optional periodic checkpoint save frequency (in steps).
 14. `train.resume_from`: optional checkpoint path to resume optimizer+model+global_step.
 15. `model.version`: architecture version (`v1_filtered_mixture` or `v2_planner_required`, default is V2 when unset).

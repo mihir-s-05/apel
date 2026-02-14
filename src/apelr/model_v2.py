@@ -116,6 +116,22 @@ class APELRV2Model(nn.Module):
         token_chunk_idx = torch.arange(seq_len, device=h.device) // self.chunk_size
         return chunk_summary, token_chunk_idx
 
+    def _apply_boundary_update(
+        self,
+        belief: torch.Tensor,
+        transition: torch.Tensor,
+        prev_chunk_summary: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Chunk-boundary update used in both training and generation.
+
+        This is a causal update: it uses only the previous chunk summary and the current belief.
+        """
+        prior = belief @ transition
+        ctx = self.cfg.planner_context_scale * self.planner_boundary_proj(prev_chunk_summary)
+        obs = self.planner_obs_proj(prev_chunk_summary)
+        return F.softmax(self._belief_log(prior) + ctx + obs, dim=-1)
+
     def _planner_states(
         self,
         chunk_summary: torch.Tensor,
@@ -278,7 +294,13 @@ class APELRV2Model(nn.Module):
             gates.append(gate_c)
         return torch.stack(gates, dim=1)
 
-    def _future_contrastive_loss(self, chunk_states: torch.Tensor, chunk_summary: torch.Tensor) -> torch.Tensor:
+    def _future_contrastive_loss(
+        self,
+        chunk_states: torch.Tensor,
+        chunk_summary: torch.Tensor,
+        *,
+        temperature: float,
+    ) -> torch.Tensor:
         bsz, num_chunks, _ = chunk_summary.shape
         if num_chunks <= 1:
             return torch.zeros((), device=chunk_summary.device)
@@ -292,14 +314,14 @@ class APELRV2Model(nn.Module):
 
         losses: list[torch.Tensor] = []
         for d in range(1, horizon + 1):
-            anchor = plan_vec[:, :-d, :].reshape(-1, plan_vec.shape[-1])
-            positive = future_vec[:, d:, :].reshape(-1, future_vec.shape[-1])
-            if anchor.numel() == 0:
-                continue
-            logits = anchor @ positive.t()
-            logits = logits / max(self.cfg.planner_temperature, 1e-4)
-            labels = torch.arange(anchor.shape[0], device=anchor.device)
-            losses.append(F.cross_entropy(logits, labels))
+             anchor = plan_vec[:, :-d, :].reshape(-1, plan_vec.shape[-1])
+             positive = future_vec[:, d:, :].reshape(-1, future_vec.shape[-1])
+             if anchor.numel() == 0:
+                 continue
+             logits = anchor @ positive.t()
+             logits = logits / max(float(temperature), 1e-4)
+             labels = torch.arange(anchor.shape[0], device=anchor.device)
+             losses.append(F.cross_entropy(logits, labels))
         if not losses:
             return torch.zeros((), device=chunk_summary.device)
         return torch.stack(losses).mean()
@@ -343,18 +365,15 @@ class APELRV2Model(nn.Module):
         """
         Returns base NLL and aux terms for V2 training/eval.
         """
+        if input_ids.shape != target_ids.shape:
+            raise ValueError(f"input_ids shape {tuple(input_ids.shape)} must match target_ids {tuple(target_ids.shape)}")
+        if planner_mode not in {"normal", "uniform_mask", "forced_state"}:
+            raise ValueError(f"Unknown planner_mode='{planner_mode}'.")
+        if commitment not in {"soft", "gumbel_st"}:
+            raise ValueError(f"Unknown commitment='{commitment}'.")
         x = self.token_emb(input_ids)
         h, _ = self.backbone(x)
-        chunk_summary, token_chunk_idx = self._chunk_summaries(h)
-        chunk_states, chunk_post = self._planner_states(
-            chunk_summary,
-            planner_mode=planner_mode,
-            forced_state=forced_state,
-            commitment=commitment,
-            planner_temperature=float(self.cfg.planner_temperature if planner_temperature is None else planner_temperature),
-            training=self.training,
-        )
-
+        chunk_summary, _token_chunk_idx_ctx = self._chunk_summaries(h)
         expert_log_probs = self._expert_log_probs(h)
         trans = self.transition_matrix()
         effective_token_filtering = bool(self.cfg.token_filtering if token_filtering is None else token_filtering)
@@ -366,56 +385,111 @@ class APELRV2Model(nn.Module):
             max(float(self.cfg.lookahead_feedback_scale if lookahead_feedback_scale is None else lookahead_feedback_scale), 0.0),
             1.0,
         )
-        if effective_token_filtering:
-            bsz, seq_len = input_ids.shape
-            mix_steps: list[torch.Tensor] = []
-            cur_chunk = int(token_chunk_idx[0].item()) if seq_len > 0 else 0
-            belief_t = chunk_states[:, cur_chunk, :]
-            for t in range(seq_len):
-                c = int(token_chunk_idx[t].item())
-                if c != cur_chunk:
-                    cur_chunk = c
-                    belief_t = chunk_states[:, cur_chunk, :]
-                gate_t, _ = self._planner_gate_with_lookahead(
-                    belief_t,
-                    trans,
-                    planner_temperature=planner_temperature if planner_temperature is not None else self.cfg.planner_temperature,
-                    lookahead_steps=effective_lookahead_steps if planner_mode == "normal" else 0,
-                    feedback_scale=effective_feedback_scale if planner_mode == "normal" else 0.0,
-                )
-                mix_t = torch.logsumexp(self._belief_log(gate_t).unsqueeze(-1) + expert_log_probs[:, t, :, :], dim=1)
-                mix_steps.append(mix_t)
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+
+        uniform = torch.full((bsz, self.num_plan_states), 1.0 / self.num_plan_states, device=device)
+        if planner_mode == "forced_state":
+            if forced_state is None:
+                raise ValueError("forced_state must be set when planner_mode='forced_state'.")
+            if forced_state < 0 or forced_state >= self.num_plan_states:
+                raise ValueError(f"forced_state={forced_state} out of range.")
+            forced = torch.zeros_like(uniform)
+            forced[:, int(forced_state)] = 1.0
+        else:
+            forced = None
+
+        planner_tau = float(self.cfg.planner_temperature if planner_temperature is None else planner_temperature)
+        planner_tau = max(planner_tau, 1e-4)
+
+        # Online planner/executor recursion (matches generation semantics).
+        belief = self._initial_belief(bsz, device)
+        chunk_posts: list[torch.Tensor] = []
+        chunk_states: list[torch.Tensor] = []
+        mix_steps: list[torch.Tensor] = []
+
+        current_chunk = 0
+        chunk_posts.append(belief)
+        if planner_mode == "uniform_mask":
+            chunk_states.append(uniform)
+            belief = uniform
+        elif forced is not None:
+            chunk_states.append(forced)
+            belief = forced
+        else:
+            if commitment == "gumbel_st" and self.training:
+                chunk_states.append(F.gumbel_softmax(self._belief_log(belief), tau=planner_tau, hard=True, dim=-1))
+                belief = chunk_states[-1]
+            else:
+                chunk_states.append(belief)
+
+        for t in range(seq_len):
+            # Determine which chunk the *target token* at index t belongs to.
+            target_chunk = int(((t + 1) // self.chunk_size))
+            if target_chunk != current_chunk:
+                if target_chunk != current_chunk + 1:
+                    raise RuntimeError(f"Unexpected chunk jump: {current_chunk} -> {target_chunk}")
+                if current_chunk >= chunk_summary.shape[1]:
+                    raise RuntimeError("Chunk summary index out of range for boundary update.")
+                if planner_mode == "normal":
+                    belief = self._apply_boundary_update(belief, trans, chunk_summary[:, current_chunk, :])
+                current_chunk = target_chunk
+                chunk_posts.append(belief)
+                if planner_mode == "uniform_mask":
+                    chunk_states.append(uniform)
+                    belief = uniform
+                elif forced is not None:
+                    chunk_states.append(forced)
+                    belief = forced
+                else:
+                    if commitment == "gumbel_st" and self.training:
+                        chunk_states.append(
+                            F.gumbel_softmax(self._belief_log(belief), tau=planner_tau, hard=True, dim=-1)
+                        )
+                        belief = chunk_states[-1]
+                    else:
+                        chunk_states.append(belief)
+
+            gate_t, _ = self._planner_gate_with_lookahead(
+                belief,
+                trans,
+                planner_temperature=planner_tau,
+                lookahead_steps=effective_lookahead_steps if planner_mode == "normal" else 0,
+                feedback_scale=effective_feedback_scale if planner_mode == "normal" else 0.0,
+            )
+            mix_t = torch.logsumexp(self._belief_log(gate_t).unsqueeze(-1) + expert_log_probs[:, t, :, :], dim=1)
+            mix_steps.append(mix_t)
+
+            if effective_token_filtering and planner_mode == "normal":
                 tgt = target_ids[:, t]
                 obs_logp = torch.gather(
                     expert_log_probs[:, t, :, :],
                     dim=-1,
                     index=tgt.view(-1, 1, 1).expand(-1, self.num_plan_states, 1),
                 ).squeeze(-1)
-                if planner_mode == "normal":
-                    belief_t = F.softmax(self._belief_log(belief_t) + obs_logp, dim=-1)
-            mix_log_probs = torch.stack(mix_steps, dim=1)
-        else:
-            chunk_gates = self._chunk_states_with_feedback(
-                chunk_states,
-                trans,
-                planner_mode=planner_mode,
-                planner_temperature=planner_temperature if planner_temperature is not None else self.cfg.planner_temperature,
-                lookahead_steps=effective_lookahead_steps,
-                feedback_scale=effective_feedback_scale,
-            )
-            mix_log_probs = self._mixture_log_probs(expert_log_probs, chunk_gates, token_chunk_idx)
+                belief = F.softmax(self._belief_log(belief) + obs_logp, dim=-1)
+
+        mix_log_probs = torch.stack(mix_steps, dim=1)
         tok_nll = F.nll_loss(
             mix_log_probs.reshape(-1, self.vocab_size),
             target_ids.reshape(-1),
             reduction="mean",
         )
 
-        boundary_entropy = -(chunk_post * (chunk_post + self.eps).log()).sum(dim=-1).mean()
-        usage = chunk_states.mean(dim=(0, 1))
+        # Aux terms use chunk-level states aligned to the chunk summaries (ignore any
+        # final "spillover" chunk that has no summary window in teacher forcing).
+        chunk_posts_t = torch.stack(chunk_posts, dim=1)
+        chunk_states_t = torch.stack(chunk_states, dim=1)
+        if chunk_posts_t.shape[1] > chunk_summary.shape[1]:
+            chunk_posts_t = chunk_posts_t[:, : chunk_summary.shape[1], :]
+            chunk_states_t = chunk_states_t[:, : chunk_summary.shape[1], :]
+
+        boundary_entropy = -(chunk_posts_t * (chunk_posts_t + self.eps).log()).sum(dim=-1).mean()
+        usage = chunk_states_t.mean(dim=(0, 1))
         uniform = torch.full_like(usage, 1.0 / self.num_plan_states)
         usage_kl = torch.sum(usage * ((usage + self.eps).log() - uniform.log()))
 
-        future_contrastive = self._future_contrastive_loss(chunk_states, chunk_summary)
+        future_contrastive = self._future_contrastive_loss(chunk_states_t, chunk_summary, temperature=planner_tau)
         plan_js_div = self._pairwise_js_div_loss(expert_log_probs)
         rep_unlikelihood = self._repetition_unlikelihood_loss(
             mix_log_probs,
@@ -424,7 +498,7 @@ class APELRV2Model(nn.Module):
             window=rep_unlikelihood_window,
         )
 
-        state_idx = torch.argmax(chunk_states, dim=-1)
+        state_idx = torch.argmax(chunk_states_t, dim=-1)
         if state_idx.shape[1] > 1:
             state_persistence = (state_idx[:, 1:] == state_idx[:, :-1]).float().mean()
         else:
@@ -521,6 +595,12 @@ class APELRV2Model(nn.Module):
         device = next(self.parameters()).device
         if len(prompt_ids) == 0:
             raise ValueError("prompt_ids cannot be empty")
+        if force_state is not None and (force_state < 0 or force_state >= self.num_plan_states):
+            raise ValueError(f"force_state={force_state} out of range.")
+        if top_p <= 0.0 or top_p > 1.0:
+            raise ValueError("top_p must be in (0, 1].")
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be >= 0")
 
         seq = list(prompt_ids)
         hidden: torch.Tensor | None = None
@@ -551,10 +631,7 @@ class APELRV2Model(nn.Module):
             if len(chunk_hidden_buffer) == 0:
                 return
             chunk_mean = torch.stack(chunk_hidden_buffer, dim=1).mean(dim=1)
-            prior = belief @ trans
-            ctx = self.cfg.planner_context_scale * self.planner_boundary_proj(chunk_mean)
-            obs = self.planner_obs_proj(chunk_mean)
-            belief = F.softmax(self._belief_log(prior) + ctx + obs, dim=-1)
+            belief = self._apply_boundary_update(belief, trans, chunk_mean)
 
         def banned_tokens_for_no_repeat_ngram(cur_seq: list[int], n: int) -> set[int]:
             if n <= 1:
@@ -617,7 +694,23 @@ class APELRV2Model(nn.Module):
         if use_async_planner and think_steps > 0:
             planner_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="apel_planner")
 
-        for tok in prompt_ids:
+        first_tok = int(prompt_ids[0])
+        tok_t = torch.tensor([[first_tok]], device=device, dtype=torch.long)
+        out, hidden = self.backbone(self.token_emb(tok_t), hidden)
+        chunk_hidden_buffer.append(out[:, -1, :])
+        token_pos += 1
+        if token_pos % self.chunk_size == 0:
+            maybe_boundary_update()
+            chunk_hidden_buffer = []
+
+        for tok in prompt_ids[1:]:
+            tok = int(tok)
+            if use_token_filtering and (not freeze_planner) and force_state is None:
+                state = hidden[-1, :, :] if hidden is not None else torch.zeros((1, self.cfg.hidden_dim), device=device)
+                expert_logits = torch.stack([head(state) for head in self.expert_heads], dim=1)
+                expert_log_probs = F.log_softmax(expert_logits, dim=-1).squeeze(0)
+                obs_logp = expert_log_probs[:, tok].unsqueeze(0)
+                belief = F.softmax(self._belief_log(belief) + obs_logp, dim=-1)
             tok_t = torch.tensor([[tok]], device=device, dtype=torch.long)
             out, hidden = self.backbone(self.token_emb(tok_t), hidden)
             chunk_hidden_buffer.append(out[:, -1, :])

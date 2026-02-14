@@ -1,0 +1,72 @@
+seed: 42
+device: cuda
+
+data:
+  source: tinystories
+  train_split: train
+  val_split: validation
+  max_train_examples: 30000
+  max_val_examples: 2000
+  min_chars: 16
+  streaming: true
+
+tokenizer:
+  type: char
+
+model:
+  version: v2_planner_required
+  num_plan_states: 8
+  num_experts: 8
+  chunk_size: 16
+  token_dim: 256
+  hidden_dim: 768
+  num_layers: 2
+  dropout: 0.1
+  planner_self_bias: 1.8
+  planner_context_scale: 1.0
+  future_horizon_chunks: 2
+  token_filtering: true
+  lookahead_horizon: 2
+  lookahead_feedback_scale: 0.25
+  async_planner: true
+  plan_temperature_start: 1.2
+  plan_temperature_end: 0.8
+  plan_commitment: soft
+
+train:
+  out_dir: runs/tinystories_v2_cuda_4070m
+  seq_len: 128
+  stride: 128
+  batch_size: auto
+  adaptive_batch:
+    enabled: true
+    probe_batch_size: 2
+    min_batch_size: 1
+    max_batch_size: 16
+    safety_factor: 0.9
+  grad_accum_steps: 2
+  precision: fp16
+  lr: 0.00055
+  lr_schedule: cosine
+  warmup_steps: 20
+  min_lr_ratio: 0.15
+  weight_decay: 0.01
+  grad_clip: 1.0
+  max_steps: 220
+  log_interval: 10
+  eval_interval: 60
+  val_batches: 20
+  preview_interval: 60
+  preview_prompt: "Once upon a time"
+  preview_tokens: 140
+  save_interval: 60
+  pin_memory: true
+  num_workers: 0
+  loss_weights:
+    usage_balance: 0.06
+    boundary_entropy: 0.03
+    future_contrastive: 0.15
+    plan_js_div: 0.35
+    rep_unlikelihood: 0.02
+    rep_window: 32
+

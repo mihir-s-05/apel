@@ -796,7 +796,7 @@ def main() -> None:
     v2_w = dict(train_cfg.get("loss_weights", {}))
     v2_future_weight = float(v2_w.get("future_contrastive", 0.0))
     v2_js_weight = float(v2_w.get("plan_js_div", 0.0))
-    v2_boundary_entropy_weight = float(v2_w.get("boundary_entropy", 0.0))
+    v2_boundary_entropy_weight = float(v2_w.get("boundary_entropy", entropy_reg_weight))
     v2_usage_weight = float(v2_w.get("usage_balance", usage_balance_weight))
     v2_rep_unlikelihood_weight = float(v2_w.get("rep_unlikelihood", 0.0))
     v2_rep_unlikelihood_window = int(v2_w.get("rep_window", 0))
