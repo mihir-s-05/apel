@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 
@@ -122,6 +123,151 @@ def _nll_sum_ids(
     return float(nll_mean.item()) * float(x.shape[1])
 
 
+@torch.inference_mode()
+def _v1_teacher_forced_log_probs(
+    model: APELRModel,
+    input_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    settings: EvalSettings,
+) -> torch.Tensor:
+    if input_ids.shape != target_ids.shape:
+        raise ValueError("input_ids and target_ids must have same shape")
+    bsz, seq_len = input_ids.shape
+    device = input_ids.device
+    with _autocast_ctx(settings):
+        logp_per_plan, ctx_logits, log_probs, _h = model._logp_per_plan(input_ids, target_ids)
+        P = model.transition_matrix()
+        belief = model.initial_belief(bsz, device)
+        mix_steps: list[torch.Tensor] = []
+        for t in range(int(seq_len)):
+            if t > 0 and t % model.chunk_size == 0:
+                belief = model._apply_chunk_boundary_update(belief, P, ctx_logits[:, t, :])
+            log_b = model._belief_log(belief)
+            mix_t = torch.logsumexp(log_b.unsqueeze(-1) + log_probs[:, t, :, :], dim=1)
+            mix_steps.append(mix_t)
+            belief = model._apply_posterior_update(belief, logp_per_plan[:, t, :])
+        return torch.stack(mix_steps, dim=1)
+
+
+@torch.inference_mode()
+def _v2_teacher_forced_log_probs(
+    model: APELRV2Model,
+    input_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    settings: EvalSettings,
+) -> torch.Tensor:
+    if input_ids.shape != target_ids.shape:
+        raise ValueError("input_ids and target_ids must have same shape")
+    bsz, seq_len = input_ids.shape
+    device = input_ids.device
+
+    effective_lookahead_steps = max(
+        0,
+        int(model.cfg.lookahead_horizon if settings.v2_lookahead_steps is None else settings.v2_lookahead_steps),
+    )
+    effective_feedback_scale = min(
+        max(
+            float(
+                model.cfg.lookahead_feedback_scale
+                if settings.v2_lookahead_feedback_scale is None
+                else settings.v2_lookahead_feedback_scale
+            ),
+            0.0,
+        ),
+        1.0,
+    )
+    planner_tau = max(float(settings.v2_planner_temperature), 1e-4)
+
+    with _autocast_ctx(settings):
+        x = model.token_emb(input_ids)
+        h, _ = model.backbone(x)
+        chunk_summary, _token_chunk_idx_ctx = model._chunk_summaries(h)
+        expert_log_probs = model._expert_log_probs(h)
+        trans = model.transition_matrix()
+
+        belief = model._initial_belief(bsz, device)
+        current_chunk = 0
+        mix_steps: list[torch.Tensor] = []
+
+        for t in range(int(seq_len)):
+            target_chunk = int(((t + 1) // model.chunk_size))
+            if target_chunk != current_chunk:
+                if target_chunk != current_chunk + 1:
+                    raise RuntimeError(f"Unexpected chunk jump: {current_chunk} -> {target_chunk}")
+                if current_chunk >= chunk_summary.shape[1]:
+                    raise RuntimeError("Chunk summary index out of range for boundary update.")
+                belief = model._apply_boundary_update(belief, trans, chunk_summary[:, current_chunk, :])
+                current_chunk = target_chunk
+
+            gate_t, _ = model._planner_gate_with_lookahead(
+                belief,
+                trans,
+                planner_temperature=planner_tau,
+                lookahead_steps=effective_lookahead_steps,
+                feedback_scale=effective_feedback_scale,
+            )
+            mix_t = torch.logsumexp(model._belief_log(gate_t).unsqueeze(-1) + expert_log_probs[:, t, :, :], dim=1)
+            mix_steps.append(mix_t)
+
+            # Online token filtering update (teacher-forced on target_ids).
+            tgt = target_ids[:, t]
+            obs_logp = torch.gather(
+                expert_log_probs[:, t, :, :],
+                dim=-1,
+                index=tgt.view(-1, 1, 1).expand(-1, model.num_plan_states, 1),
+            ).squeeze(-1)
+            belief = F.softmax(model._belief_log(belief) + obs_logp, dim=-1)
+
+        return torch.stack(mix_steps, dim=1)
+
+
+@torch.inference_mode()
+def _teacher_forced_log_probs(
+    model: torch.nn.Module,
+    model_version: str,
+    input_ids: torch.Tensor,
+    target_ids: torch.Tensor,
+    settings: EvalSettings,
+) -> torch.Tensor:
+    if model_version == MODEL_VERSION_V1:
+        return _v1_teacher_forced_log_probs(model, input_ids, target_ids, settings)
+    if model_version == MODEL_VERSION_V2:
+        return _v2_teacher_forced_log_probs(model, input_ids, target_ids, settings)
+    if model_version == MODEL_VERSION_TRANSFORMER:
+        with _autocast_ctx(settings):
+            logits = model.forward(input_ids)
+        return F.log_softmax(logits.float(), dim=-1)
+    raise ValueError(f"Unsupported model_version '{model_version}'.")
+
+
+@torch.inference_mode()
+def _continuation_nll_sum_and_first_log_probs(
+    model: torch.nn.Module,
+    model_version: str,
+    full_ids: list[int],
+    *,
+    prefix_len: int,
+    settings: EvalSettings,
+) -> tuple[float, torch.Tensor | None]:
+    if len(full_ids) < 2:
+        return 0.0, None
+    if prefix_len <= 0:
+        raise ValueError("prefix_len must be > 0")
+    if prefix_len >= len(full_ids):
+        return 0.0, None
+
+    x = torch.tensor(full_ids[:-1], device=settings.device, dtype=torch.long).unsqueeze(0)
+    y = torch.tensor(full_ids[1:], device=settings.device, dtype=torch.long).unsqueeze(0)
+    start_t = max(int(prefix_len) - 1, 0)
+
+    log_probs = _teacher_forced_log_probs(model, model_version, x, y, settings)  # [1, T, V]
+    sel = log_probs[:, start_t:, :]
+    tgt = y[:, start_t:]
+    lp = torch.gather(sel, dim=-1, index=tgt.unsqueeze(-1)).squeeze(-1)
+    nll_sum = float((-lp).sum().item())
+    first = log_probs[0, start_t, :]
+    return nll_sum, first
+
 def _truncate_prompt_keep_bos(
     *,
     bos_id: int,
@@ -135,6 +281,18 @@ def _truncate_prompt_keep_bos(
     keep_prompt = max(0, int(keep_prompt))
     tail = prompt_no_bos[-keep_prompt:] if keep_prompt > 0 else []
     return [int(bos_id)] + [int(x) for x in tail]
+
+
+def _truncate_continuation(cont_ids: list[int], *, max_input_len: int) -> list[int]:
+    # Ensure (BOS + prompt_tail + cont_ids) can fit in max_input_len+1 tokens by
+    # hard-capping the continuation when necessary (e.g., PIQA can be long under small BPE vocabs).
+    max_total = int(max_input_len) + 1
+    max_cont = max_total - 1
+    if max_cont <= 0:
+        return []
+    if len(cont_ids) <= max_cont:
+        return cont_ids
+    return cont_ids[:max_cont]
 
 
 def _pick_join(ctx: str, ending: str) -> str:
@@ -174,17 +332,21 @@ def _score_choices(
     means: list[float] = []
     for choice in choices:
         cont = tokenizer.encode(choice, add_bos=False, add_eos=False)
-        cont_ids = [int(x) for x in cont]
+        cont_ids = _truncate_continuation([int(x) for x in cont], max_input_len=settings.max_input_len)
         prompt_ids = _truncate_prompt_keep_bos(
             bos_id=int(tokenizer.bos_id),
             prompt_no_bos=prompt_no_bos,
             cont_ids=cont_ids,
             max_input_len=settings.max_input_len,
         )
-        prompt_nll = _nll_sum_ids(model, model_version, prompt_ids, settings)
         full_ids = prompt_ids + cont_ids
-        full_nll = _nll_sum_ids(model, model_version, full_ids, settings)
-        cond = full_nll - prompt_nll
+        cond, _first = _continuation_nll_sum_and_first_log_probs(
+            model,
+            model_version,
+            full_ids,
+            prefix_len=len(prompt_ids),
+            settings=settings,
+        )
         denom = max(len(cont_ids), 1)
         sums.append(float(cond))
         means.append(float(cond) / float(denom))
@@ -239,24 +401,14 @@ def eval_wikitext_ppl(
     for x, y in loader:
         x = x.to(settings.device)
         y = y.to(settings.device)
-        with _autocast_ctx(settings):
-            if model_version == MODEL_VERSION_V1:
-                nll, _aux = model.filtered_nll(x, y)
-            elif model_version == MODEL_VERSION_V2:
-                nll, _aux = model.compute_losses(
-                    x,
-                    y,
-                    planner_mode="normal",
-                    commitment=settings.v2_commitment,
-                    planner_temperature=settings.v2_planner_temperature,
-                    lookahead_steps=settings.v2_lookahead_steps,
-                    lookahead_feedback_scale=settings.v2_lookahead_feedback_scale,
-                    rep_unlikelihood_window=0,
-                )
-            elif model_version == MODEL_VERSION_TRANSFORMER:
+        if model_version in {MODEL_VERSION_V1, MODEL_VERSION_V2}:
+            log_probs = _teacher_forced_log_probs(model, model_version, x, y, settings)
+            nll = F.nll_loss(log_probs.reshape(-1, tokenizer.vocab_size), y.reshape(-1), reduction="mean")
+        elif model_version == MODEL_VERSION_TRANSFORMER:
+            with _autocast_ctx(settings):
                 nll = model.nll(x, y)
-            else:
-                raise ValueError(f"Unsupported model_version '{model_version}'.")
+        else:
+            raise ValueError(f"Unsupported model_version '{model_version}'.")
         losses.append(float(nll.item()))
 
     mean_loss = _mean(losses)
@@ -272,8 +424,10 @@ def eval_lambada_openai(
     settings: EvalSettings,
 ) -> dict[str, float]:
     ds = load_dataset("EleutherAI/lambada_openai", split="test")
-    nlls: list[float] = []
-    acc1: list[float] = []
+    total_nll = 0.0
+    total_tokens = 0
+    correct_1tok = 0
+    total_1tok = 0
 
     upper = min(len(ds), int(settings.max_examples))
     for i in range(upper):
@@ -286,69 +440,44 @@ def eval_lambada_openai(
         prompt = " ".join(parts[:-1])
         target = " " + str(parts[-1])
 
-        # Score target as a continuation.
-        scores_sum, _scores_mean = _score_choices(
-            model=model,
-            model_version=model_version,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            choices=[target],
+        prompt_no_bos = [int(x) for x in tokenizer.encode(prompt, add_bos=False, add_eos=False)]
+        cont_ids = _truncate_continuation(
+            [int(x) for x in tokenizer.encode(target, add_bos=False, add_eos=False)],
+            max_input_len=settings.max_input_len,
+        )
+        if not cont_ids:
+            continue
+        prompt_ids = _truncate_prompt_keep_bos(
+            bos_id=int(tokenizer.bos_id),
+            prompt_no_bos=prompt_no_bos,
+            cont_ids=cont_ids,
+            max_input_len=settings.max_input_len,
+        )
+        full_ids = prompt_ids + cont_ids
+        nll_sum, first = _continuation_nll_sum_and_first_log_probs(
+            model,
+            model_version,
+            full_ids,
+            prefix_len=len(prompt_ids),
             settings=settings,
         )
-        nlls.append(float(scores_sum[0]) / max(1.0, float(len(tokenizer.encode(target, add_bos=False, add_eos=False)))))
+        total_nll += float(nll_sum)
+        total_tokens += int(len(cont_ids))
+        if len(cont_ids) == 1 and first is not None:
+            pred = int(torch.argmax(first).item())
+            correct_1tok += int(pred == int(cont_ids[0]))
+            total_1tok += 1
 
-        # Optional 1-token accuracy via greedy next-token (top_k=1), only when the target is a single token.
-        tgt_ids = tokenizer.encode(target, add_bos=False, add_eos=False)
-        if len(tgt_ids) == 1:
-            prompt_ids = [int(tokenizer.bos_id)] + [int(x) for x in tokenizer.encode(prompt, add_bos=False, add_eos=False)]
-            prompt_ids = prompt_ids[-(settings.max_input_len + 1) :]
-            if model_version == MODEL_VERSION_V1:
-                out_ids, _ = model.generate_filtered(
-                    prompt_ids=prompt_ids,
-                    max_new_tokens=1,
-                    temperature=1.0,
-                    top_k=1,
-                    top_p=1.0,
-                    eos_id=None,
-                    lookahead_steps=0,
-                    repetition_penalty=1.0,
-                    no_repeat_ngram_size=0,
-                )
-            elif model_version == MODEL_VERSION_V2:
-                out_ids, _ = model.generate_planned(
-                    prompt_ids=prompt_ids,
-                    max_new_tokens=1,
-                    temperature=1.0,
-                    top_k=1,
-                    top_p=1.0,
-                    eos_id=None,
-                    lookahead_steps=0,
-                    planner_temperature=settings.v2_planner_temperature,
-                    repetition_penalty=1.0,
-                    no_repeat_ngram_size=0,
-                )
-            elif model_version == MODEL_VERSION_TRANSFORMER:
-                out_ids = model.generate(
-                    prompt_ids=prompt_ids,
-                    max_new_tokens=1,
-                    temperature=1.0,
-                    top_k=1,
-                    top_p=1.0,
-                    eos_id=None,
-                    repetition_penalty=1.0,
-                    no_repeat_ngram_size=0,
-                )
-            else:
-                out_ids = prompt_ids
-            pred = int(out_ids[-1]) if len(out_ids) > len(prompt_ids) else -1
-            acc1.append(float(pred == int(tgt_ids[0])))
-
-    mean_nll = _mean(nlls)
+    if total_tokens <= 0:
+        return {"nll_per_token": float("nan"), "ppl": float("nan"), "acc_1tok": float("nan"), "examples": float(upper)}
+    mean_nll = float(total_nll) / float(total_tokens)
     return {
         "nll_per_token": mean_nll,
         "ppl": float(math.exp(min(mean_nll, 20.0))),
-        "acc_1tok": float(_mean(acc1)) if acc1 else float("nan"),
+        "acc_1tok": float(correct_1tok) / float(total_1tok) if total_1tok > 0 else float("nan"),
         "examples": float(upper),
+        "tokens": float(total_tokens),
+        "examples_1tok": float(total_1tok),
     }
 
 

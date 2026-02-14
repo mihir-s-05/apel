@@ -1,0 +1,93 @@
+seed: 42
+device: cuda
+
+data:
+  source: fineweb_edu
+  train_split: train
+  val_split: train
+  streaming: true
+  min_chars: 64
+  token_cache: true
+  token_cache_dir: runs/fineweb_edu_scale_270m/token_cache
+  reuse_token_cache: true
+  max_train_examples: 2000000
+  max_val_examples: 50000
+  max_train_tokens: 500000000
+  max_val_tokens: 20000000
+  tokenizer_fit_max_examples: 150000
+  tokenizer_fit_max_chars: 30000000
+
+tokenizer:
+  type: bpe
+  vocab_size: 32768
+  min_frequency: 2
+  byte_level: true
+  lowercase: false
+  special_tokens:
+    - "<pad>"
+    - "<bos>"
+    - "<eos>"
+    - "<unk>"
+
+model:
+  version: v2_planner_required
+  num_plan_states: 4
+  num_experts: 4
+  chunk_size: 16
+  token_dim: 512
+  hidden_dim: 1536
+  num_layers: 4
+  dropout: 0.1
+  planner_self_bias: 2.0
+  planner_context_scale: 1.0
+  future_horizon_chunks: 3
+  plan_commitment: gumbel_st
+  commitment_warmup_steps: 500
+  plan_temperature_start: 1.15
+  plan_temperature_end: 0.75
+  token_filtering: true
+  lookahead_horizon: 2
+  lookahead_feedback_scale: 0.25
+  async_planner: true
+
+train:
+  out_dir: runs/fineweb_edu_scale_270m
+  seq_len: 1024
+  stride: 1024
+  batch_size: auto
+  adaptive_batch:
+    enabled: true
+    probe_batch_size: 1
+    min_batch_size: 1
+    max_batch_size: 16
+    safety_factor: 0.9
+    reprobe_interval_steps: 0
+  grad_accum_steps: 16
+  precision: bf16
+  lr: 0.00015
+  lr_schedule: cosine
+  warmup_steps: 500
+  min_lr_ratio: 0.1
+  weight_decay: 0.01
+  grad_clip: 1.0
+  max_steps: 20000
+  log_interval: 20
+  eval_interval: 500
+  val_batches: 20
+  preview_interval: 500
+  preview_prompt: "In a surprising turn,"
+  preview_tokens: 220
+  loss_weights:
+    usage_balance: 0.05
+    boundary_entropy: 0.02
+    future_contrastive: 0.10
+    plan_js_div: 0.10
+    rep_unlikelihood: 0.0
+    rep_window: 64
+  save_interval: 1000
+  save_optimizer_state: false
+  distributed:
+    backend: nccl
+    zero_optimizer: true
+  num_workers: 2
+  pin_memory: true

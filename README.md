@@ -188,6 +188,22 @@ train:
     reprobe_interval_steps: 500
 ```
 
+Multi-GPU (DDP) is supported when you launch via `torchrun` (WORLD_SIZE > 1). Example (Linux):
+
+```bash
+torchrun --nproc_per_node=8 -m apelr.train --config configs/fineweb_edu_scale_pilot_65m.yaml
+```
+
+Optional distributed knobs:
+
+```yaml
+train:
+  distributed:
+    backend: nccl
+    zero_optimizer: true  # shards AdamW optimizer states across ranks
+  save_optimizer_state: false  # avoids huge checkpoints; enable for exact resume
+```
+
 ## Sampling Options
 
 Common flags for `apelr.sample`:

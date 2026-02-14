@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
+from dataclasses import dataclass
 import hashlib
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -12,9 +15,13 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import yaml
 from torch.optim import AdamW
+from torch.distributed.optim import ZeroRedundancyOptimizer
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, IterableDataset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 from .data import (
@@ -39,6 +46,90 @@ MODEL_VERSION_V1 = "v1_filtered_mixture"
 MODEL_VERSION_V2 = "v2_planner_required"
 MODEL_VERSION_TRANSFORMER = "transformer_lm"
 CONFIG_SCHEMA_VERSION = 2
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    enabled: bool
+    rank: int
+    local_rank: int
+    world_size: int
+    backend: str
+
+    @property
+    def is_main(self) -> bool:
+        return (not self.enabled) or self.rank == 0
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+def _parse_distributed_context(train_cfg: dict[str, Any], *, device_type: str) -> DistributedContext:
+    dist_cfg = train_cfg.get("distributed", {})
+    if isinstance(dist_cfg, bool):
+        cfg_enabled = bool(dist_cfg)
+        dist_cfg = {}
+    elif isinstance(dist_cfg, dict):
+        cfg_enabled = bool(dist_cfg.get("enabled", False))
+    else:
+        cfg_enabled = False
+        dist_cfg = {}
+
+    world_size_env = _env_int("WORLD_SIZE", 1)
+    enabled = int(world_size_env) > 1
+    if not enabled:
+        if cfg_enabled:
+            print(
+                "Warning: train.distributed.enabled=true but WORLD_SIZE=1. "
+                "Run with torchrun (or set WORLD_SIZE/RANK/LOCAL_RANK) to enable distributed training."
+            )
+        return DistributedContext(enabled=False, rank=0, local_rank=0, world_size=1, backend="")
+
+    rank = _env_int("RANK", 0)
+    local_rank = _env_int("LOCAL_RANK", rank)
+    backend = str(dist_cfg.get("backend") or "").strip().lower()
+    if not backend:
+        want_nccl = device_type == "cuda" and dist.is_nccl_available() and os.name != "nt"
+        backend = "nccl" if want_nccl else "gloo"
+    return DistributedContext(
+        enabled=True,
+        rank=int(rank),
+        local_rank=int(local_rank),
+        world_size=int(world_size_env),
+        backend=backend,
+    )
+
+
+def _maybe_init_process_group(ctx: DistributedContext) -> None:
+    if not ctx.enabled:
+        return
+    if dist.is_initialized():
+        return
+    dist.init_process_group(backend=ctx.backend, rank=ctx.rank, world_size=ctx.world_size)
+
+
+def _maybe_barrier(ctx: DistributedContext) -> None:
+    if ctx.enabled and dist.is_initialized():
+        dist.barrier()
+
+
+def _broadcast_int(ctx: DistributedContext, value: int, *, device: torch.device) -> int:
+    if not ctx.enabled or not dist.is_initialized():
+        return int(value)
+    t = torch.tensor([int(value) if ctx.is_main else 0], device=device, dtype=torch.int64)
+    dist.broadcast(t, src=0)
+    return int(t.item())
+
+
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DDP) else model
 
 
 def set_seed(seed: int) -> None:
@@ -582,19 +673,43 @@ def save_checkpoint(
     tokenizer_meta: dict[str, Any],
     model_version: str,
     global_step: int,
+    dist_ctx: DistributedContext | None = None,
+    save_optimizer_state: bool = True,
 ) -> None:
+    ctx = dist_ctx or DistributedContext(enabled=False, rank=0, local_rank=0, world_size=1, backend="")
+    core_model = unwrap_model(model)
+
+    opt_state: dict[str, Any] | None = None
+    if save_optimizer_state:
+        if isinstance(optimizer, ZeroRedundancyOptimizer):
+            if ctx.enabled:
+                optimizer.consolidate_state_dict(to=0)
+                if ctx.is_main:
+                    opt_state = optimizer.state_dict()
+            else:
+                opt_state = optimizer.state_dict()
+        else:
+            opt_state = optimizer.state_dict()
+
+    if not ctx.is_main:
+        return
+
     checkpoint = {
         "config_schema_version": CONFIG_SCHEMA_VERSION,
         "model_version": model_version,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
+        "model_state_dict": core_model.state_dict(),
+        "optimizer_state_dict": opt_state,
         "global_step": int(global_step),
-        "model_config": model.cfg.__dict__,
+        "model_config": core_model.cfg.__dict__,
         "tokenizer_path": str(tokenizer_path),
         "tokenizer_hash": file_sha256(tokenizer_path),
         "tokenizer_type": tokenizer_type,
         "tokenizer_config": tokenizer_meta,
         "train_config": train_cfg,
+        "distributed": {
+            "world_size": int(ctx.world_size),
+            "backend": str(ctx.backend),
+        },
     }
     torch.save(checkpoint, path)
 
@@ -605,10 +720,16 @@ def build_loaders(
     val_ds: Dataset,
     batch_size: int,
     train_cfg: dict[str, Any],
+    dist_ctx: DistributedContext | None = None,
+    seed: int = 42,
 ) -> tuple[DataLoader, DataLoader]:
+    ctx = dist_ctx or DistributedContext(enabled=False, rank=0, local_rank=0, world_size=1, backend="")
     num_workers = int(train_cfg.get("num_workers", 0))
     pin_memory = bool(train_cfg.get("pin_memory", False))
+    train_sampler = None
     if isinstance(train_ds, IterableDataset):
+        if ctx.enabled and ctx.is_main:
+            print("Warning: IterableDataset does not support DistributedSampler; each rank will see the full stream.")
         train_loader = DataLoader(
             train_ds,
             batch_size=batch_size,
@@ -617,10 +738,20 @@ def build_loaders(
             pin_memory=pin_memory,
         )
     else:
+        if ctx.enabled:
+            train_sampler = DistributedSampler(
+                train_ds,
+                num_replicas=int(ctx.world_size),
+                rank=int(ctx.rank),
+                shuffle=True,
+                seed=int(seed),
+                drop_last=True,
+            )
         train_loader = DataLoader(
             train_ds,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
             drop_last=True,
             num_workers=num_workers,
             pin_memory=pin_memory,
@@ -642,21 +773,38 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    set_seed(int(cfg.get("seed", 42)))
+    seed = int(cfg.get("seed", 42))
 
     train_cfg = cfg["train"]
     data_cfg = cfg["data"]
     model_cfg = cfg["model"]
     tokenizer_cfg = cfg.get("tokenizer", {"type": "char"})
 
+    requested_device_name = str(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    requested_device = torch.device(requested_device_name)
+    if requested_device.type == "cuda" and not torch.cuda.is_available():
+        print("Warning: device='cuda' requested but CUDA is not available. Falling back to CPU.")
+        requested_device = torch.device("cpu")
+
+    dist_ctx = _parse_distributed_context(train_cfg, device_type=requested_device.type)
+    device = requested_device
+    if dist_ctx.enabled and requested_device.type == "cuda" and torch.cuda.is_available():
+        device = torch.device(f"cuda:{dist_ctx.local_rank}")
+        torch.cuda.set_device(device)
+    _maybe_init_process_group(dist_ctx)
+
+    set_seed(seed)
+
     out_dir = Path(train_cfg["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
+    is_main = dist_ctx.is_main
 
     source = data_cfg["source"]
     spec = get_dataset_spec(source)
     token_cache_enabled = bool(data_cfg.get("token_cache", False))
 
-    print(f"Loading dataset source={source} ({spec.path})...")
+    if is_main:
+        print(f"Loading dataset source={source} ({spec.path})...")
     train_text = ""
     val_text = ""
     train_stats: dict[str, int] = {}
@@ -680,10 +828,12 @@ def main() -> None:
             streaming=data_cfg.get("streaming"),
             cache_dir=data_cfg.get("cache_dir"),
         )
-        print(f"Train stats: {train_stats}")
-        print(f"Val stats:   {val_stats}")
+        if is_main:
+            print(f"Train stats: {train_stats}")
+            print(f"Val stats:   {val_stats}")
     else:
-        print("Token-cache mode enabled: using on-disk tokenized corpora for large-scale training.")
+        if is_main:
+            print("Token-cache mode enabled: using on-disk tokenized corpora for large-scale training.")
 
     resume_from = train_cfg.get("resume_from")
     resume_ckpt: dict[str, Any] | None = None
@@ -705,8 +855,21 @@ def main() -> None:
             cache_dir=data_cfg.get("cache_dir"),
         )
         train_text = fit_text
-        print(f"Tokenizer fit stats: {fit_stats}")
+        if is_main:
+            print(f"Tokenizer fit stats: {fit_stats}")
         return train_text
+
+    tokenizer_path = out_dir / "tokenizer.json"
+    tokenizer_type = str(tokenizer_cfg.get("type", "char")).lower()
+    tokenizer_meta: dict[str, Any] = {}
+    if tokenizer_type == "bpe":
+        tokenizer_meta = {
+            "vocab_size": int(tokenizer_cfg.get("vocab_size", 4096)),
+            "min_frequency": int(tokenizer_cfg.get("min_frequency", 2)),
+            "byte_level": bool(tokenizer_cfg.get("byte_level", True)),
+            "lowercase": bool(tokenizer_cfg.get("lowercase", False)),
+            "special_tokens": list(tokenizer_cfg.get("special_tokens", SPECIAL_TOKENS)),
+        }
 
     if resume_from:
         resume_path = Path(str(resume_from))
@@ -715,28 +878,31 @@ def main() -> None:
         resume_ckpt = torch.load(resume_path, map_location="cpu")
         ckpt_tok_path = resume_ckpt.get("tokenizer_path")
         if ckpt_tok_path:
-            tokenizer_type = str(resume_ckpt.get("tokenizer_type", "char"))
-            tokenizer_meta = dict(resume_ckpt.get("tokenizer_config", {}))
+            tokenizer_type = str(resume_ckpt.get("tokenizer_type", tokenizer_type))
+            tokenizer_meta = dict(resume_ckpt.get("tokenizer_config", tokenizer_meta))
+
+    if is_main:
+        if resume_ckpt is not None and resume_ckpt.get("tokenizer_path"):
+            ckpt_tok_path = Path(str(resume_ckpt["tokenizer_path"]))
             tokenizer = load_tokenizer(
-                Path(ckpt_tok_path),
+                ckpt_tok_path,
                 tokenizer_type=tokenizer_type,
                 special_tokens=tokenizer_meta.get("special_tokens"),
             )
-            tokenizer_path = out_dir / "tokenizer.json"
             tokenizer.save(tokenizer_path)
             print(f"Tokenizer loaded from resume checkpoint: type={tokenizer_type}, vocab size={tokenizer.vocab_size}")
         else:
             tokenizer_seed_text = ensure_tokenizer_seed_text()
             tokenizer, tokenizer_type, tokenizer_meta = build_tokenizer(tokenizer_cfg, tokenizer_seed_text)
-            tokenizer_path = out_dir / "tokenizer.json"
             tokenizer.save(tokenizer_path)
             print(f"Tokenizer type: {tokenizer_type}, vocab size: {tokenizer.vocab_size}")
-    else:
-        tokenizer_seed_text = ensure_tokenizer_seed_text()
-        tokenizer, tokenizer_type, tokenizer_meta = build_tokenizer(tokenizer_cfg, tokenizer_seed_text)
-        tokenizer_path = out_dir / "tokenizer.json"
-        tokenizer.save(tokenizer_path)
-        print(f"Tokenizer type: {tokenizer_type}, vocab size: {tokenizer.vocab_size}")
+
+    _maybe_barrier(dist_ctx)
+    tokenizer = load_tokenizer(
+        tokenizer_path,
+        tokenizer_type=tokenizer_type,
+        special_tokens=tokenizer_meta.get("special_tokens"),
+    )
 
     model_version = get_model_version(model_cfg, resume_ckpt)
     if resume_ckpt is not None and "model_version" in resume_ckpt:
@@ -755,43 +921,46 @@ def main() -> None:
         val_token_path = Path(str(data_cfg.get("val_token_file", token_cache_dir / "val.bin")))
         reuse_token_cache = bool(data_cfg.get("reuse_token_cache", True))
 
-        if (not reuse_token_cache) or (not train_token_path.exists()):
-            train_cache_stats = write_tokenized_corpus(
-                source=source,
-                split=data_cfg.get("train_split", spec.train_split),
-                tokenizer=tokenizer,
-                output_path=train_token_path,
-                max_examples=int(data_cfg["max_train_examples"]),
-                max_tokens=(int(data_cfg["max_train_tokens"]) if data_cfg.get("max_train_tokens") is not None else None),
-                min_chars=int(data_cfg.get("min_chars", 8)),
-                max_chars=(int(data_cfg["max_train_chars"]) if data_cfg.get("max_train_chars") is not None else None),
-                streaming=data_cfg.get("streaming"),
-                cache_dir=data_cfg.get("cache_dir"),
-                add_bos=True,
-                add_eos=True,
-            )
-            print(f"Train token cache stats: {train_cache_stats}")
-        else:
-            print(f"Reusing train token cache: {train_token_path}")
+        if is_main:
+            if (not reuse_token_cache) or (not train_token_path.exists()):
+                train_cache_stats = write_tokenized_corpus(
+                    source=source,
+                    split=data_cfg.get("train_split", spec.train_split),
+                    tokenizer=tokenizer,
+                    output_path=train_token_path,
+                    max_examples=int(data_cfg["max_train_examples"]),
+                    max_tokens=(int(data_cfg["max_train_tokens"]) if data_cfg.get("max_train_tokens") is not None else None),
+                    min_chars=int(data_cfg.get("min_chars", 8)),
+                    max_chars=(int(data_cfg["max_train_chars"]) if data_cfg.get("max_train_chars") is not None else None),
+                    streaming=data_cfg.get("streaming"),
+                    cache_dir=data_cfg.get("cache_dir"),
+                    add_bos=True,
+                    add_eos=True,
+                )
+                print(f"Train token cache stats: {train_cache_stats}")
+            else:
+                print(f"Reusing train token cache: {train_token_path}")
 
-        if (not reuse_token_cache) or (not val_token_path.exists()):
-            val_cache_stats = write_tokenized_corpus(
-                source=source,
-                split=data_cfg.get("val_split", spec.val_split),
-                tokenizer=tokenizer,
-                output_path=val_token_path,
-                max_examples=int(data_cfg["max_val_examples"]),
-                max_tokens=(int(data_cfg["max_val_tokens"]) if data_cfg.get("max_val_tokens") is not None else None),
-                min_chars=int(data_cfg.get("min_chars", 8)),
-                max_chars=(int(data_cfg["max_val_chars"]) if data_cfg.get("max_val_chars") is not None else None),
-                streaming=data_cfg.get("streaming"),
-                cache_dir=data_cfg.get("cache_dir"),
-                add_bos=True,
-                add_eos=True,
-            )
-            print(f"Val token cache stats: {val_cache_stats}")
-        else:
-            print(f"Reusing val token cache: {val_token_path}")
+            if (not reuse_token_cache) or (not val_token_path.exists()):
+                val_cache_stats = write_tokenized_corpus(
+                    source=source,
+                    split=data_cfg.get("val_split", spec.val_split),
+                    tokenizer=tokenizer,
+                    output_path=val_token_path,
+                    max_examples=int(data_cfg["max_val_examples"]),
+                    max_tokens=(int(data_cfg["max_val_tokens"]) if data_cfg.get("max_val_tokens") is not None else None),
+                    min_chars=int(data_cfg.get("min_chars", 8)),
+                    max_chars=(int(data_cfg["max_val_chars"]) if data_cfg.get("max_val_chars") is not None else None),
+                    streaming=data_cfg.get("streaming"),
+                    cache_dir=data_cfg.get("cache_dir"),
+                    add_bos=True,
+                    add_eos=True,
+                )
+                print(f"Val token cache stats: {val_cache_stats}")
+            else:
+                print(f"Reusing val token cache: {val_token_path}")
+
+        _maybe_barrier(dist_ctx)
 
         train_ds = PackedMemmapDataset(train_token_path, seq_len=seq_len, stride=stride)
         val_ds = PackedMemmapDataset(val_token_path, seq_len=seq_len, stride=seq_len)
@@ -802,25 +971,45 @@ def main() -> None:
         val_ds = PackedSequenceDataset(val_ids, seq_len=seq_len, stride=seq_len)
 
     model = instantiate_model(model_cfg=model_cfg, vocab_size=tokenizer.vocab_size, model_version=model_version)
-
-    device_name = cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device_name)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
     model.to(device)
 
-    print(f"Device: {device}")
-    print(f"Model version: {model_version}")
-    print(f"Model parameters: {model.count_parameters():,}")
-    print(f"Train sequences: {len(train_ds):,}, Val sequences: {len(val_ds):,}")
+    if is_main:
+        if dist_ctx.enabled:
+            print(f"Distributed: backend={dist_ctx.backend}, world_size={dist_ctx.world_size}")
+        print(f"Device: {device}")
+        print(f"Model version: {model_version}")
+        print(f"Model parameters: {model.count_parameters():,}")
+        print(f"Train sequences: {len(train_ds):,}, Val sequences: {len(val_ds):,}")
 
     base_lr = float(train_cfg["lr"])
-    optimizer = AdamW(
-        model.parameters(),
-        lr=base_lr,
-        weight_decay=float(train_cfg.get("weight_decay", 0.01)),
-        betas=(0.9, 0.95),
-    )
+    weight_decay = float(train_cfg.get("weight_decay", 0.01))
+    dist_cfg = train_cfg.get("distributed", {})
+    if isinstance(dist_cfg, dict):
+        use_zero = bool(dist_cfg.get("zero_optimizer", False))
+    else:
+        use_zero = False
+    if use_zero and not dist_ctx.enabled:
+        if is_main:
+            print("Warning: train.distributed.zero_optimizer=true but distributed training is not enabled; using AdamW.")
+        use_zero = False
+
+    if dist_ctx.enabled and use_zero:
+        optimizer = ZeroRedundancyOptimizer(
+            model.parameters(),
+            optimizer_class=AdamW,
+            lr=base_lr,
+            weight_decay=weight_decay,
+            betas=(0.9, 0.95),
+        )
+    else:
+        optimizer = AdamW(
+            model.parameters(),
+            lr=base_lr,
+            weight_decay=weight_decay,
+            betas=(0.9, 0.95),
+        )
 
     grad_clip = float(train_cfg.get("grad_clip", 1.0))
     max_steps = int(train_cfg["max_steps"])
@@ -884,7 +1073,8 @@ def main() -> None:
     use_amp = device.type == "cuda" and precision in {"fp16", "bf16"}
     amp_dtype = torch.float16 if precision == "fp16" else torch.bfloat16
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and precision == "fp16"))
-    print(f"Precision: {precision}, grad_accum_steps: {grad_accum_steps}, use_amp: {use_amp}")
+    if is_main:
+        print(f"Precision: {precision}, grad_accum_steps: {grad_accum_steps}, use_amp: {use_amp}")
 
     loss_weights = {
         "entropy_reg": entropy_reg_weight,
@@ -899,25 +1089,46 @@ def main() -> None:
         "v2_rep_unlikelihood": v2_rep_unlikelihood_weight,
     }
 
-    batch_size = resolve_batch_size(
-        train_cfg=train_cfg,
-        device=device,
-        model=model,
-        model_version=model_version,
-        train_ds=train_ds,
-        use_amp=use_amp,
-        amp_dtype=amp_dtype,
-        loss_weights=loss_weights,
-        v2_commitment=v2_commitment,
-        v2_plan_temperature=v2_plan_temperature_start,
-        v2_rep_unlikelihood_window=v2_rep_unlikelihood_window,
-    )
+    if dist_ctx.enabled:
+        if is_main:
+            batch_size = resolve_batch_size(
+                train_cfg=train_cfg,
+                device=device,
+                model=model,
+                model_version=model_version,
+                train_ds=train_ds,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+                loss_weights=loss_weights,
+                v2_commitment=v2_commitment,
+                v2_plan_temperature=v2_plan_temperature_start,
+                v2_rep_unlikelihood_window=v2_rep_unlikelihood_window,
+            )
+        else:
+            batch_size = 0
+        batch_size = _broadcast_int(dist_ctx, batch_size, device=device)
+    else:
+        batch_size = resolve_batch_size(
+            train_cfg=train_cfg,
+            device=device,
+            model=model,
+            model_version=model_version,
+            train_ds=train_ds,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            loss_weights=loss_weights,
+            v2_commitment=v2_commitment,
+            v2_plan_temperature=v2_plan_temperature_start,
+            v2_rep_unlikelihood_window=v2_rep_unlikelihood_window,
+        )
 
     train_loader, val_loader = build_loaders(
         train_ds=train_ds,
         val_ds=val_ds,
         batch_size=batch_size,
         train_cfg=train_cfg,
+        dist_ctx=dist_ctx,
+        seed=seed,
     )
     adaptive_batch_cfg = train_cfg.get("adaptive_batch", {})
     batch_size_raw = train_cfg.get("batch_size", 1)
@@ -933,6 +1144,7 @@ def main() -> None:
     dynamic_reprobe = adaptive_batch_enabled and device.type == "cuda" and reprobe_interval_steps > 0
 
     save_interval = int(train_cfg.get("save_interval", 0))
+    save_optimizer_state = bool(train_cfg.get("save_optimizer_state", True))
 
     global_step = 0
     if resume_from:
@@ -946,23 +1158,41 @@ def main() -> None:
         model.load_state_dict(resume_ckpt["model_state_dict"], strict=False)
         opt_state = resume_ckpt.get("optimizer_state_dict")
         if opt_state is not None:
-            optimizer.load_state_dict(opt_state)
+            try:
+                optimizer.load_state_dict(opt_state)
+            except Exception as exc:
+                if is_main:
+                    print(f"Warning: failed to load optimizer state (continuing without it): {exc!r}")
         global_step = int(resume_ckpt.get("global_step", 0))
-        print(f"Resumed from {Path(str(resume_from))} at global_step={global_step}")
+        if is_main:
+            print(f"Resumed from {Path(str(resume_from))} at global_step={global_step}")
+
+    if dist_ctx.enabled:
+        ddp_device_ids = [int(device.index)] if device.type == "cuda" and device.index is not None else None
+        model = DDP(model, device_ids=ddp_device_ids, broadcast_buffers=False)
+    core_model = unwrap_model(model)
 
     start_time = time.time()
 
     model.train()
-    progress = tqdm(total=max_steps, initial=global_step, desc="train")
+    progress = tqdm(total=max_steps, initial=global_step, desc="train", disable=(not is_main))
     micro_step = 0
+    epoch = 0
+    tokens_seen = 0
     optimizer.zero_grad(set_to_none=True)
     while global_step < max_steps:
+        sampler = getattr(train_loader, "sampler", None)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+        epoch += 1
+
         reprobe_triggered = False
         for x, y in train_loader:
             if global_step >= max_steps:
                 break
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            tokens_seen += int(x.shape[0]) * int(x.shape[1])
             current_lr = (
                 cosine_lr_with_warmup(
                     step=global_step,
@@ -976,72 +1206,80 @@ def main() -> None:
             )
             set_optimizer_lr(optimizer, current_lr)
 
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                if model_version == MODEL_VERSION_V1:
-                    nll, aux = model.filtered_nll(x, y)
-                    if chunk_bow_warmup_steps > 0:
-                        chunk_warm = min(1.0, float(global_step + 1) / float(max(chunk_bow_warmup_steps, 1)))
-                    else:
+            accum_steps = max(int(grad_accum_steps), 1)
+            will_step = ((micro_step + 1) % accum_steps) == 0
+            sync_ctx = (
+                model.no_sync()
+                if (dist_ctx.enabled and accum_steps > 1 and not will_step)
+                else nullcontext()
+            )
+            with sync_ctx:
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    if model_version == MODEL_VERSION_V1:
+                        nll, aux = core_model.filtered_nll(x, y)
+                        if chunk_bow_warmup_steps > 0:
+                            chunk_warm = min(1.0, float(global_step + 1) / float(max(chunk_bow_warmup_steps, 1)))
+                        else:
+                            chunk_warm = 1.0
+                        effective_chunk_bow_weight = chunk_bow_weight * chunk_warm
+                        loss = (
+                            nll
+                            + entropy_reg_weight * aux["belief_entropy"]
+                            + usage_balance_weight * aux["usage_kl_to_uniform"]
+                            + effective_chunk_bow_weight * aux["chunk_bow_loss"]
+                            - plan_mi_weight * aux["plan_mi"]
+                            + chunk_post_kl_weight * aux["chunk_post_kl"]
+                        )
+                    elif model_version == MODEL_VERSION_V2:
+                        progress_frac = float(global_step) / float(max(max_steps - 1, 1))
+                        current_plan_temp = lerp(v2_plan_temperature_start, v2_plan_temperature_end, progress_frac)
+                        current_commitment = (
+                            "soft"
+                            if (v2_commitment == "gumbel_st" and global_step < v2_commitment_warmup_steps)
+                            else v2_commitment
+                        )
+                        nll, aux = core_model.compute_losses(
+                            x,
+                            y,
+                            planner_mode="normal",
+                            commitment=current_commitment,
+                            planner_temperature=current_plan_temp,
+                            rep_unlikelihood_window=v2_rep_unlikelihood_window,
+                        )
                         chunk_warm = 1.0
-                    effective_chunk_bow_weight = chunk_bow_weight * chunk_warm
-                    loss = (
-                        nll
-                        + entropy_reg_weight * aux["belief_entropy"]
-                        + usage_balance_weight * aux["usage_kl_to_uniform"]
-                        + effective_chunk_bow_weight * aux["chunk_bow_loss"]
-                        - plan_mi_weight * aux["plan_mi"]
-                        + chunk_post_kl_weight * aux["chunk_post_kl"]
-                    )
-                elif model_version == MODEL_VERSION_V2:
-                    progress_frac = float(global_step) / float(max(max_steps - 1, 1))
-                    current_plan_temp = lerp(v2_plan_temperature_start, v2_plan_temperature_end, progress_frac)
-                    current_commitment = (
-                        "soft"
-                        if (v2_commitment == "gumbel_st" and global_step < v2_commitment_warmup_steps)
-                        else v2_commitment
-                    )
-                    nll, aux = model.compute_losses(
-                        x,
-                        y,
-                        planner_mode="normal",
-                        commitment=current_commitment,
-                        planner_temperature=current_plan_temp,
-                        rep_unlikelihood_window=v2_rep_unlikelihood_window,
-                    )
-                    chunk_warm = 1.0
-                    effective_chunk_bow_weight = 0.0
-                    loss = (
-                        nll
-                        + v2_usage_weight * aux["usage_kl_to_uniform"]
-                        + v2_boundary_entropy_weight * aux["boundary_entropy"]
-                        + v2_future_weight * aux["future_contrastive_loss"]
-                        - v2_js_weight * aux["plan_js_div_loss"]
-                        + v2_rep_unlikelihood_weight * aux["rep_unlikelihood_loss"]
-                    )
-                elif model_version == MODEL_VERSION_TRANSFORMER:
-                    nll = model.nll(x, y)
-                    aux = {}
-                    current_plan_temp = 1.0
-                    chunk_warm = 1.0
-                    effective_chunk_bow_weight = 0.0
-                    loss = nll
+                        effective_chunk_bow_weight = 0.0
+                        loss = (
+                            nll
+                            + v2_usage_weight * aux["usage_kl_to_uniform"]
+                            + v2_boundary_entropy_weight * aux["boundary_entropy"]
+                            + v2_future_weight * aux["future_contrastive_loss"]
+                            - v2_js_weight * aux["plan_js_div_loss"]
+                            + v2_rep_unlikelihood_weight * aux["rep_unlikelihood_loss"]
+                        )
+                    elif model_version == MODEL_VERSION_TRANSFORMER:
+                        nll = core_model.nll(x, y)
+                        aux = {}
+                        current_plan_temp = 1.0
+                        chunk_warm = 1.0
+                        effective_chunk_bow_weight = 0.0
+                        loss = nll
+                    else:
+                        raise ValueError(f"Unsupported model version '{model_version}'.")
+
+                    loss_for_backward = loss / float(accum_steps)
+
+                if scaler.is_enabled():
+                    scaler.scale(loss_for_backward).backward()
                 else:
-                    raise ValueError(f"Unsupported model version '{model_version}'.")
-
-                loss_for_backward = loss / float(max(grad_accum_steps, 1))
-
-            if scaler.is_enabled():
-                scaler.scale(loss_for_backward).backward()
-            else:
-                loss_for_backward.backward()
+                    loss_for_backward.backward()
             micro_step += 1
 
-            if micro_step % max(grad_accum_steps, 1) != 0:
+            if not will_step:
                 continue
 
             if scaler.is_enabled():
                 scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+            torch.nn.utils.clip_grad_norm_(core_model.parameters(), max_norm=grad_clip)
             if scaler.is_enabled():
                 scaler.step(optimizer)
                 scaler.update()
@@ -1050,22 +1288,43 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
 
             global_step += 1
-            progress.update(1)
+            if is_main:
+                progress.update(1)
 
             if dynamic_reprobe and (global_step % reprobe_interval_steps == 0) and global_step < max_steps:
-                new_batch_size = resolve_batch_size(
-                    train_cfg=train_cfg,
-                    device=device,
-                    model=model,
-                    model_version=model_version,
-                    train_ds=train_ds,
-                    use_amp=use_amp,
-                    amp_dtype=amp_dtype,
-                    loss_weights=loss_weights,
-                    v2_commitment=v2_commitment,
-                    v2_plan_temperature=v2_plan_temperature_start,
-                    v2_rep_unlikelihood_window=v2_rep_unlikelihood_window,
-                )
+                if dist_ctx.enabled:
+                    if is_main:
+                        with model.no_sync():
+                            new_batch_size = resolve_batch_size(
+                                train_cfg=train_cfg,
+                                device=device,
+                                model=core_model,
+                                model_version=model_version,
+                                train_ds=train_ds,
+                                use_amp=use_amp,
+                                amp_dtype=amp_dtype,
+                                loss_weights=loss_weights,
+                                v2_commitment=v2_commitment,
+                                v2_plan_temperature=v2_plan_temperature_start,
+                                v2_rep_unlikelihood_window=v2_rep_unlikelihood_window,
+                            )
+                    else:
+                        new_batch_size = 0
+                    new_batch_size = _broadcast_int(dist_ctx, new_batch_size, device=device)
+                else:
+                    new_batch_size = resolve_batch_size(
+                        train_cfg=train_cfg,
+                        device=device,
+                        model=core_model,
+                        model_version=model_version,
+                        train_ds=train_ds,
+                        use_amp=use_amp,
+                        amp_dtype=amp_dtype,
+                        loss_weights=loss_weights,
+                        v2_commitment=v2_commitment,
+                        v2_plan_temperature=v2_plan_temperature_start,
+                        v2_rep_unlikelihood_window=v2_rep_unlikelihood_window,
+                    )
                 if new_batch_size != batch_size:
                     batch_size = new_batch_size
                     train_loader, val_loader = build_loaders(
@@ -1073,14 +1332,18 @@ def main() -> None:
                         val_ds=val_ds,
                         batch_size=batch_size,
                         train_cfg=train_cfg,
+                        dist_ctx=dist_ctx,
+                        seed=seed,
                     )
-                    print(f"\n[adaptive batch] step={global_step} updated batch_size={batch_size}")
+                    if is_main:
+                        print(f"\n[adaptive batch] step={global_step} updated batch_size={batch_size}")
                     reprobe_triggered = True
                     break
 
-            if global_step % log_interval == 0 or global_step == 1:
+            if is_main and (global_step % log_interval == 0 or global_step == 1):
                 elapsed = time.time() - start_time
-                tok_per_s = (global_step * x.shape[0] * x.shape[1] * max(grad_accum_steps, 1)) / max(elapsed, 1e-6)
+                total_tokens = int(tokens_seen) * (int(dist_ctx.world_size) if dist_ctx.enabled else 1)
+                tok_per_s = float(total_tokens) / max(elapsed, 1e-6)
                 if model_version == MODEL_VERSION_V1:
                     progress.set_postfix(
                         loss=f"{loss.item():.4f}",
@@ -1129,63 +1392,67 @@ def main() -> None:
                         if (v2_commitment == "gumbel_st" and global_step < v2_commitment_warmup_steps)
                         else v2_commitment
                     )
-                eval_metrics = evaluate_model(
-                    model,
-                    model_version,
-                    val_loader,
-                    device,
-                    max_batches=val_batches,
-                    rep_unlikelihood_window=v2_rep_unlikelihood_window,
-                    v2_commitment=eval_commitment,
-                    v2_planner_temperature=eval_plan_temp,
-                )
-                if model_version == MODEL_VERSION_V1:
-                    print(
-                        f"\n[eval step {global_step}] "
-                        f"val_loss={eval_metrics['loss']:.4f} "
-                        f"val_ppl={eval_metrics['ppl']:.2f} "
-                        f"belief_ent={eval_metrics['belief_entropy']:.3f} "
-                        f"usage_kl={eval_metrics['usage_kl_to_uniform']:.3f} "
-                        f"chunk_bow={eval_metrics['chunk_bow_loss']:.3f} "
-                        f"plan_mi={eval_metrics['plan_mi']:.3f} "
-                        f"chunk_post_kl={eval_metrics['chunk_post_kl']:.3f}"
+                if is_main:
+                    eval_metrics = evaluate_model(
+                        core_model,
+                        model_version,
+                        val_loader,
+                        device,
+                        max_batches=val_batches,
+                        rep_unlikelihood_window=v2_rep_unlikelihood_window,
+                        v2_commitment=eval_commitment,
+                        v2_planner_temperature=eval_plan_temp,
                     )
-                elif model_version == MODEL_VERSION_V2:
-                    print(
-                        f"\n[eval step {global_step}] "
-                        f"val_loss={eval_metrics['loss']:.4f} "
-                        f"val_ppl={eval_metrics['ppl']:.2f} "
-                        f"usage_kl={eval_metrics['usage_kl_to_uniform']:.3f} "
-                        f"bent={eval_metrics['boundary_entropy']:.3f} "
-                        f"fcl={eval_metrics['future_contrastive_loss']:.3f} "
-                        f"js={eval_metrics['plan_js_div_loss']:.3f} "
-                        f"repu={eval_metrics['rep_unlikelihood_loss']:.3f} "
-                        f"fb_d={eval_metrics['feedback_delta_loss']:.3f} "
-                        f"mask_d={eval_metrics['planner_mask_delta_loss']:.3f} "
-                        f"force_js={eval_metrics['forced_state_divergence']:.3f} "
-                        f"sp={eval_metrics['state_persistence']:.3f} "
-                        f"eu={eval_metrics['expert_utilization']:.3f}"
-                    )
-                elif model_version == MODEL_VERSION_TRANSFORMER:
-                    print(
-                        f"\n[eval step {global_step}] "
-                        f"val_loss={eval_metrics['loss']:.4f} "
-                        f"val_ppl={eval_metrics['ppl']:.2f}"
-                    )
-                else:
-                    raise ValueError(f"Unsupported model version '{model_version}'.")
-                model.train()
+                    if model_version == MODEL_VERSION_V1:
+                        print(
+                            f"\n[eval step {global_step}] "
+                            f"val_loss={eval_metrics['loss']:.4f} "
+                            f"val_ppl={eval_metrics['ppl']:.2f} "
+                            f"belief_ent={eval_metrics['belief_entropy']:.3f} "
+                            f"usage_kl={eval_metrics['usage_kl_to_uniform']:.3f} "
+                            f"chunk_bow={eval_metrics['chunk_bow_loss']:.3f} "
+                            f"plan_mi={eval_metrics['plan_mi']:.3f} "
+                            f"chunk_post_kl={eval_metrics['chunk_post_kl']:.3f}"
+                        )
+                    elif model_version == MODEL_VERSION_V2:
+                        print(
+                            f"\n[eval step {global_step}] "
+                            f"val_loss={eval_metrics['loss']:.4f} "
+                            f"val_ppl={eval_metrics['ppl']:.2f} "
+                            f"usage_kl={eval_metrics['usage_kl_to_uniform']:.3f} "
+                            f"bent={eval_metrics['boundary_entropy']:.3f} "
+                            f"fcl={eval_metrics['future_contrastive_loss']:.3f} "
+                            f"js={eval_metrics['plan_js_div_loss']:.3f} "
+                            f"repu={eval_metrics['rep_unlikelihood_loss']:.3f} "
+                            f"fb_d={eval_metrics['feedback_delta_loss']:.3f} "
+                            f"mask_d={eval_metrics['planner_mask_delta_loss']:.3f} "
+                            f"force_js={eval_metrics['forced_state_divergence']:.3f} "
+                            f"sp={eval_metrics['state_persistence']:.3f} "
+                            f"eu={eval_metrics['expert_utilization']:.3f}"
+                        )
+                    elif model_version == MODEL_VERSION_TRANSFORMER:
+                        print(
+                            f"\n[eval step {global_step}] "
+                            f"val_loss={eval_metrics['loss']:.4f} "
+                            f"val_ppl={eval_metrics['ppl']:.2f}"
+                        )
+                    else:
+                        raise ValueError(f"Unsupported model version '{model_version}'.")
+                _maybe_barrier(dist_ctx)
+                core_model.train()
 
             if global_step % preview_interval == 0 or global_step == max_steps:
-                preview = maybe_sample_preview(
-                    model=model,
-                    model_version=model_version,
-                    tokenizer=tokenizer,
-                    prompt=preview_prompt,
-                    max_new_tokens=preview_tokens,
-                )
-                print(f"\n[sample step {global_step}] {sanitize_for_console(preview[:500])}\n")
-                model.train()
+                if is_main:
+                    preview = maybe_sample_preview(
+                        model=core_model,
+                        model_version=model_version,
+                        tokenizer=tokenizer,
+                        prompt=preview_prompt,
+                        max_new_tokens=preview_tokens,
+                    )
+                    print(f"\n[sample step {global_step}] {sanitize_for_console(preview[:500])}\n")
+                _maybe_barrier(dist_ctx)
+                core_model.train()
 
             if save_interval > 0 and (global_step % save_interval == 0 or global_step == max_steps):
                 save_checkpoint(
@@ -1198,8 +1465,12 @@ def main() -> None:
                     tokenizer_meta=tokenizer_meta,
                     model_version=model_version,
                     global_step=global_step,
+                    dist_ctx=dist_ctx,
+                    save_optimizer_state=save_optimizer_state,
                 )
-                print(f"\n[checkpoint step {global_step}] saved to {out_dir / 'checkpoint.pt'}")
+                _maybe_barrier(dist_ctx)
+                if is_main:
+                    print(f"\n[checkpoint step {global_step}] saved to {out_dir / 'checkpoint.pt'}")
         if reprobe_triggered:
             continue
 
@@ -1216,40 +1487,52 @@ def main() -> None:
         tokenizer_meta=tokenizer_meta,
         model_version=model_version,
         global_step=global_step,
+        dist_ctx=dist_ctx,
+        save_optimizer_state=save_optimizer_state,
     )
+    _maybe_barrier(dist_ctx)
 
-    metrics = evaluate_model(
-        model,
-        model_version,
-        val_loader,
-        device,
-        max_batches=val_batches,
-        rep_unlikelihood_window=v2_rep_unlikelihood_window,
-        v2_commitment=(
-            "soft"
-            if (model_version == MODEL_VERSION_V2 and v2_commitment == "gumbel_st" and global_step < v2_commitment_warmup_steps)
-            else v2_commitment
-        ),
-        v2_planner_temperature=lerp(
-            v2_plan_temperature_start,
-            v2_plan_temperature_end,
-            float(global_step) / float(max(max_steps - 1, 1)),
-        ),
-    )
-    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    if model_version == MODEL_VERSION_V2:
-        planner_eval = {
-            "planner_mask_delta_loss": metrics.get("planner_mask_delta_loss"),
-            "forced_state_divergence": metrics.get("forced_state_divergence"),
-            "state_persistence": metrics.get("state_persistence"),
-            "expert_utilization": metrics.get("expert_utilization"),
-            "future_contrastive_loss": metrics.get("future_contrastive_loss"),
-            "plan_js_div_loss": metrics.get("plan_js_div_loss"),
-            "feedback_delta_loss": metrics.get("feedback_delta_loss"),
-        }
-        (out_dir / "planner_eval.json").write_text(json.dumps(planner_eval, indent=2), encoding="utf-8")
-    print(f"Saved checkpoint to: {ckpt_path}")
-    print(f"Final metrics: {metrics}")
+    if is_main:
+        metrics = evaluate_model(
+            core_model,
+            model_version,
+            val_loader,
+            device,
+            max_batches=val_batches,
+            rep_unlikelihood_window=v2_rep_unlikelihood_window,
+            v2_commitment=(
+                "soft"
+                if (
+                    model_version == MODEL_VERSION_V2
+                    and v2_commitment == "gumbel_st"
+                    and global_step < v2_commitment_warmup_steps
+                )
+                else v2_commitment
+            ),
+            v2_planner_temperature=lerp(
+                v2_plan_temperature_start,
+                v2_plan_temperature_end,
+                float(global_step) / float(max(max_steps - 1, 1)),
+            ),
+        )
+        (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        if model_version == MODEL_VERSION_V2:
+            planner_eval = {
+                "planner_mask_delta_loss": metrics.get("planner_mask_delta_loss"),
+                "forced_state_divergence": metrics.get("forced_state_divergence"),
+                "state_persistence": metrics.get("state_persistence"),
+                "expert_utilization": metrics.get("expert_utilization"),
+                "future_contrastive_loss": metrics.get("future_contrastive_loss"),
+                "plan_js_div_loss": metrics.get("plan_js_div_loss"),
+                "feedback_delta_loss": metrics.get("feedback_delta_loss"),
+            }
+            (out_dir / "planner_eval.json").write_text(json.dumps(planner_eval, indent=2), encoding="utf-8")
+        print(f"Saved checkpoint to: {ckpt_path}")
+        print(f"Final metrics: {metrics}")
+
+    _maybe_barrier(dist_ctx)
+    if dist_ctx.enabled and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

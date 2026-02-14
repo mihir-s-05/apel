@@ -364,6 +364,10 @@ class APELRV2Model(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """
         Returns base NLL and aux terms for V2 training/eval.
+
+        The core planner recursion matches generation semantics, but is computed in
+        chunk-wise segments to reduce Python-level per-token overhead and avoid
+        materializing full [B, T, V] tensors unless required.
         """
         if input_ids.shape != target_ids.shape:
             raise ValueError(f"input_ids shape {tuple(input_ids.shape)} must match target_ids {tuple(target_ids.shape)}")
@@ -371,10 +375,12 @@ class APELRV2Model(nn.Module):
             raise ValueError(f"Unknown planner_mode='{planner_mode}'.")
         if commitment not in {"soft", "gumbel_st"}:
             raise ValueError(f"Unknown commitment='{commitment}'.")
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+
         x = self.token_emb(input_ids)
         h, _ = self.backbone(x)
         chunk_summary, _token_chunk_idx_ctx = self._chunk_summaries(h)
-        expert_log_probs = self._expert_log_probs(h)
         trans = self.transition_matrix()
         effective_token_filtering = bool(self.cfg.token_filtering if token_filtering is None else token_filtering)
         effective_lookahead_steps = max(
@@ -385,8 +391,6 @@ class APELRV2Model(nn.Module):
             max(float(self.cfg.lookahead_feedback_scale if lookahead_feedback_scale is None else lookahead_feedback_scale), 0.0),
             1.0,
         )
-        bsz, seq_len = input_ids.shape
-        device = input_ids.device
 
         uniform = torch.full((bsz, self.num_plan_states), 1.0 / self.num_plan_states, device=device)
         if planner_mode == "forced_state":
@@ -402,79 +406,116 @@ class APELRV2Model(nn.Module):
         planner_tau = float(self.cfg.planner_temperature if planner_temperature is None else planner_temperature)
         planner_tau = max(planner_tau, 1e-4)
 
-        # Online planner/executor recursion (matches generation semantics).
+        def segment_bounds(chunk_idx: int) -> tuple[int, int]:
+            if chunk_idx == 0:
+                t_start = 0
+                t_end = min(int(seq_len) - 1, int(self.chunk_size) - 2)
+                return t_start, t_end
+            t_start = int(chunk_idx) * int(self.chunk_size) - 1
+            t_end = min(int(seq_len) - 1, (int(chunk_idx) + 1) * int(self.chunk_size) - 2)
+            return t_start, t_end
+
+        # Online planner/executor recursion (matches generation semantics), but
+        # evaluated in segments to keep compute in large tensor ops.
         belief = self._initial_belief(bsz, device)
         chunk_posts: list[torch.Tensor] = []
         chunk_states: list[torch.Tensor] = []
-        mix_steps: list[torch.Tensor] = []
 
-        current_chunk = 0
-        chunk_posts.append(belief)
-        if planner_mode == "uniform_mask":
-            chunk_states.append(uniform)
-            belief = uniform
-        elif forced is not None:
-            chunk_states.append(forced)
-            belief = forced
-        else:
+        def append_chunk_state(belief_in: torch.Tensor) -> torch.Tensor:
+            chunk_posts.append(belief_in)
+            if planner_mode == "uniform_mask":
+                chunk_states.append(uniform)
+                return uniform
+            if forced is not None:
+                chunk_states.append(forced)
+                return forced
             if commitment == "gumbel_st" and self.training:
-                chunk_states.append(F.gumbel_softmax(self._belief_log(belief), tau=planner_tau, hard=True, dim=-1))
-                belief = chunk_states[-1]
-            else:
-                chunk_states.append(belief)
+                state = F.gumbel_softmax(self._belief_log(belief_in), tau=planner_tau, hard=True, dim=-1)
+                chunk_states.append(state)
+                return state
+            chunk_states.append(belief_in)
+            return belief_in
 
-        for t in range(seq_len):
-            # Determine which chunk the *target token* at index t belongs to.
-            target_chunk = int(((t + 1) // self.chunk_size))
-            if target_chunk != current_chunk:
-                if target_chunk != current_chunk + 1:
-                    raise RuntimeError(f"Unexpected chunk jump: {current_chunk} -> {target_chunk}")
-                if current_chunk >= chunk_summary.shape[1]:
-                    raise RuntimeError("Chunk summary index out of range for boundary update.")
+        belief = append_chunk_state(belief)
+
+        # Accumulate NLL without materializing the full [B, T, V] tensor.
+        nll_sum = torch.zeros((), device=device, dtype=torch.float32)
+        js_weighted_sum = torch.zeros((), device=device, dtype=torch.float32)
+        js_token_total = 0
+        mix_segs: list[torch.Tensor] = []
+
+        max_chunk_idx = int(seq_len) // int(self.chunk_size)
+        for chunk_idx in range(max_chunk_idx + 1):
+            if chunk_idx > 0:
                 if planner_mode == "normal":
-                    belief = self._apply_boundary_update(belief, trans, chunk_summary[:, current_chunk, :])
-                current_chunk = target_chunk
-                chunk_posts.append(belief)
-                if planner_mode == "uniform_mask":
-                    chunk_states.append(uniform)
-                    belief = uniform
-                elif forced is not None:
-                    chunk_states.append(forced)
-                    belief = forced
-                else:
-                    if commitment == "gumbel_st" and self.training:
-                        chunk_states.append(
-                            F.gumbel_softmax(self._belief_log(belief), tau=planner_tau, hard=True, dim=-1)
-                        )
-                        belief = chunk_states[-1]
-                    else:
-                        chunk_states.append(belief)
+                    summary_idx = int(chunk_idx) - 1
+                    if summary_idx >= int(chunk_summary.shape[1]):
+                        raise RuntimeError("Chunk summary index out of range for boundary update.")
+                    belief = self._apply_boundary_update(belief, trans, chunk_summary[:, summary_idx, :])
+                belief = append_chunk_state(belief)
 
-            gate_t, _ = self._planner_gate_with_lookahead(
-                belief,
+            t_start, t_end = segment_bounds(int(chunk_idx))
+            if t_start > t_end:
+                continue
+
+            h_seg = h[:, t_start : t_end + 1, :]
+            tgt_seg = target_ids[:, t_start : t_end + 1]
+            seg_len = int(tgt_seg.shape[1])
+
+            expert_log_probs_seg = self._expert_log_probs(h_seg)  # [B, L, K, V]
+
+            # Expert separation metric (mean JS), weighted by tokens.
+            js_seg = self._pairwise_js_div_loss(expert_log_probs_seg)
+            js_weighted_sum = js_weighted_sum + js_seg.float() * float(bsz * seg_len)
+            js_token_total += int(bsz * seg_len)
+
+            # Token-time evidence for filtering (teacher-forced on target_ids).
+            obs_logp = torch.gather(
+                expert_log_probs_seg,
+                dim=-1,
+                index=tgt_seg.view(bsz, seg_len, 1, 1).expand(bsz, seg_len, self.num_plan_states, 1),
+            ).squeeze(-1)  # [B, L, K]
+
+            if effective_token_filtering and planner_mode == "normal":
+                log_u0 = self._belief_log(belief)  # [B, K]
+                log_u_after = log_u0.unsqueeze(1) + torch.cumsum(obs_logp, dim=1)  # [B, L, K]
+                log_u_before = torch.cat([log_u0.unsqueeze(1), log_u_after[:, :-1, :]], dim=1)
+                belief_before = F.softmax(log_u_before, dim=-1)
+                belief_end = F.softmax(log_u_after[:, -1, :], dim=-1)
+            else:
+                belief_before = belief.unsqueeze(1).expand(-1, seg_len, -1)
+                belief_end = belief
+
+            gate_flat, _ = self._planner_gate_with_lookahead(
+                belief_before.reshape(-1, self.num_plan_states),
                 trans,
                 planner_temperature=planner_tau,
                 lookahead_steps=effective_lookahead_steps if planner_mode == "normal" else 0,
                 feedback_scale=effective_feedback_scale if planner_mode == "normal" else 0.0,
             )
-            mix_t = torch.logsumexp(self._belief_log(gate_t).unsqueeze(-1) + expert_log_probs[:, t, :, :], dim=1)
-            mix_steps.append(mix_t)
+            gate = gate_flat.view(bsz, seg_len, self.num_plan_states)
 
-            if effective_token_filtering and planner_mode == "normal":
-                tgt = target_ids[:, t]
-                obs_logp = torch.gather(
-                    expert_log_probs[:, t, :, :],
-                    dim=-1,
-                    index=tgt.view(-1, 1, 1).expand(-1, self.num_plan_states, 1),
-                ).squeeze(-1)
-                belief = F.softmax(self._belief_log(belief) + obs_logp, dim=-1)
+            mix_log_seg = torch.logsumexp(self._belief_log(gate).unsqueeze(-1) + expert_log_probs_seg, dim=2)
+            logp_tgt = torch.gather(mix_log_seg, dim=-1, index=tgt_seg.unsqueeze(-1)).squeeze(-1)
+            nll_sum = nll_sum + (-logp_tgt.float()).sum()
 
-        mix_log_probs = torch.stack(mix_steps, dim=1)
-        tok_nll = F.nll_loss(
-            mix_log_probs.reshape(-1, self.vocab_size),
-            target_ids.reshape(-1),
-            reduction="mean",
-        )
+            if rep_unlikelihood_window > 0:
+                mix_segs.append(mix_log_seg)
+
+            belief = belief_end
+
+        tok_nll = nll_sum / float(max(int(bsz) * int(seq_len), 1))
+
+        if rep_unlikelihood_window > 0:
+            mix_log_probs = torch.cat(mix_segs, dim=1)
+            rep_unlikelihood = self._repetition_unlikelihood_loss(
+                mix_log_probs,
+                input_ids=input_ids,
+                target_ids=target_ids,
+                window=rep_unlikelihood_window,
+            )
+        else:
+            rep_unlikelihood = torch.zeros((), device=device)
 
         # Aux terms use chunk-level states aligned to the chunk summaries (ignore any
         # final "spillover" chunk that has no summary window in teacher forcing).
@@ -490,13 +531,7 @@ class APELRV2Model(nn.Module):
         usage_kl = torch.sum(usage * ((usage + self.eps).log() - uniform.log()))
 
         future_contrastive = self._future_contrastive_loss(chunk_states_t, chunk_summary, temperature=planner_tau)
-        plan_js_div = self._pairwise_js_div_loss(expert_log_probs)
-        rep_unlikelihood = self._repetition_unlikelihood_loss(
-            mix_log_probs,
-            input_ids=input_ids,
-            target_ids=target_ids,
-            window=rep_unlikelihood_window,
-        )
+        plan_js_div = js_weighted_sum / float(max(js_token_total, 1))
 
         state_idx = torch.argmax(chunk_states_t, dim=-1)
         if state_idx.shape[1] > 1:
