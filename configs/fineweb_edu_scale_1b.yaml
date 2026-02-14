@@ -65,7 +65,7 @@ train:
     max_batch_size: 8
     safety_factor: 0.9
     reprobe_interval_steps: 0
-  grad_accum_steps: 32
+  grad_accum_steps: 1
   precision: bf16
   lr: 0.0001
   lr_schedule: cosine
@@ -92,5 +92,5 @@ train:
   distributed:
     backend: nccl
     zero_optimizer: true
-  num_workers: 4
+  num_workers: 0
   pin_memory: true

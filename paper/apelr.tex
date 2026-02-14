@@ -11,7 +11,7 @@
 \usepackage{array}
 \usepackage{multirow}
 \usepackage{graphicx}
-\usepackage{hyperref}
+\usepackage[hypertexnames=false]{hyperref}
 \usepackage[capitalize,noabbrev]{cleveref}
 \usepackage[numbers,sort&compress]{natbib}
 \usepackage{algorithm}
@@ -63,6 +63,7 @@ To support ``think-while-speak'' in wall-clock time, the planner can asynchronou
 
 This report is implementation-faithful: we derive the exact and approximate inference modes implied by the factorization, identify a core train--inference mismatch that arises from stale chunk beliefs, and show how \APELR{} tightens the recursion so training and generation share the same causal update semantics.
 We present preliminary experiments on TinyStories and WikiText-2 that quantify planner utilization via intervention-style diagnostics (planner masking and forced-state divergences), and ablations demonstrating that (i) online token filtering reduces loss compared to stale chunk beliefs and (ii) lookahead-to-emission feedback can measurably change likelihood under the trained policy.
+Finally, we outline a practical scaling roadmap from the current small/medium prototype regime to $\sim$1B-parameter training.
 \end{abstract}
 
 \section{Introduction}
@@ -75,18 +76,9 @@ This report focuses on a concrete architectural and mathematical question:
 \emph{What probabilistic structure admits concurrent planning during autoregressive generation, and what implementation choices are required to keep training and inference aligned?}
 We use \APEL{} as the conceptual model class and \APELR{} as the implemented prototype in this repository (\texttt{src/apelr}).
 
-\paragraph{Contributions.}
-\begin{enumerate}
-  \item We formalize \APEL{} as a chunk-latent autoregressive model and distinguish exact and approximate decoding modes, clarifying where ``exactness'' claims hold (\Cref{sec:apel-model,sec:inference-modes}).
-  \item We describe \APELR{} as a \emph{state-space policy LM} in which an internal discrete belief state is updated causally from realized tokens and chunk summaries and gates expert emission heads (\Cref{sec:apelr-arch}).
-  \item We specify an asynchronous inference schedule for lookahead forecasting and show what is non-interfering (provably distribution-preserving) versus what is a deliberate policy modification (feedback-coupled lookahead) (\Cref{sec:async}).
-  \item We document the objective used in \APELR{}, including auxiliary losses designed to prevent planner bypass and encourage expert specialization (\Cref{sec:training}).
-  \item We present preliminary empirical results and ablations on TinyStories and WikiText-2, including intervention-based planner diagnostics and controlled toggles for token filtering and lookahead feedback (\Cref{sec:experiments}).
-\end{enumerate}
-
-\begin{figure}[t]
+\begin{figure}[!t]
 \centering
-\resizebox{0.92\linewidth}{!}{%
+\resizebox{0.86\linewidth}{!}{%
 \begin{tikzpicture}[
   node distance=7mm,
   box/.style={draw, rounded corners, align=center, text width=24mm, minimum height=7mm, inner sep=2pt},
@@ -113,7 +105,8 @@ We use \APEL{} as the conceptual model class and \APELR{} as the implemented pro
   \draw[arrow] (gate) -- (mix);
   \draw[arrow] (mix) -- (sample);
 
-  \draw[arrow] (sample) |- node[pos=0.25, right, align=left, font=\small] {token filtering\\update $\B_{t+1}$} (belief);
+  % Place this label to the left to avoid pushing the figure bounding box past the page margin.
+  \draw[arrow] (sample) |- node[pos=0.25, left, align=right, font=\small] {token filtering\\update $\B_{t+1}$} (belief);
   \draw[arrow] (gru) -- node[midway, right, font=\small] {chunk summary $s_c$} (belief);
   \draw[arrow] (belief) -- (gate);
   \draw[arrow] (transition) -- (belief);
@@ -122,9 +115,21 @@ We use \APEL{} as the conceptual model class and \APELR{} as the implemented pro
   \draw[arrow] (lookahead) -- node[midway, right, font=\small] {feedback $\lambda$} (gate);
 \end{tikzpicture}%
 }
-\caption{Schematic of \APELR{} V2. The executor produces hidden states; experts produce state-conditional token distributions; the planner maintains an online belief over discrete plan states; optional lookahead forecasting can be computed asynchronously and fed back into the gating distribution.}
+\caption{Schematic of \APELR{} (mainline implementation). The executor produces hidden states; experts produce state-conditional token distributions; the planner maintains an online belief over discrete plan states; optional lookahead forecasting can be computed asynchronously and fed back into the gating distribution.}
 \label{fig:apelr-v2-schematic}
 \end{figure}
+
+\paragraph{Contributions.}
+\begin{samepage}
+\begin{enumerate}
+  \item We formalize \APEL{} as a chunk-latent autoregressive model and distinguish exact and approximate decoding modes, clarifying where ``exactness'' claims hold (\Cref{sec:apel-model,sec:inference-modes}).
+  \item We describe \APELR{} as a \emph{state-space policy LM} in which an internal discrete belief state is updated causally from realized tokens and chunk summaries and gates expert emission heads (\Cref{sec:apelr-arch}).
+  \item We specify an asynchronous inference schedule for lookahead forecasting and show what is non-interfering (provably distribution-preserving) versus what is a deliberate policy modification (feedback-coupled lookahead) (\Cref{sec:async}).
+  \item We document the objective used in \APELR{}, including auxiliary losses designed to prevent planner bypass and encourage expert specialization (\Cref{sec:training}).
+  \item We present preliminary empirical results and ablations on TinyStories and WikiText-2, including intervention-based planner diagnostics and controlled toggles for token filtering and lookahead feedback (\Cref{sec:experiments}).
+  \item We outline a practical engineering and experimental roadmap for scaling \APELR{} beyond the current prototype regime toward $\sim$1B parameters (\Cref{sec:scaling}).
+\end{enumerate}
+\end{samepage}
 
 \section{Background and Motivation}
 \label{sec:background}
@@ -219,13 +224,18 @@ Using a fixed chunk-start belief $\bvec_c$ for all $t\in \mathcal{I}_c$,
 \]
 is generally approximate unless $\bvec_{c,t}\approx \bvec_c$ throughout the chunk.
 
-\begin{proposition}[Stale chunk mixture is not exact in general]
+\begin{proposition}[Stale chunk mixture is generally approximate]
 \label{prop:stale-not-exact}
-For the model class in \Cref{eq:apel-joint}, the stale-belief mixture in Mode C equals the true conditional $p_\theta(y_t\mid x,y_{<t})$ for all $t\in \mathcal{I}_c$ only if $\bvec_{c,t}=\bvec_c$ (almost surely) for those $t$.
+Fix a token position $t\in\mathcal{I}_c$ and define state-conditional emission vectors
+$p_z(\cdot):=p_\theta(\cdot\mid x,y_{<t},z_c=z)$.
+Let $p(\cdot)=\sum_z \bvec_{c,t}(z)p_z(\cdot)$ denote the exact conditional, and let $\tilde p(\cdot)=\sum_z \bvec_c(z)p_z(\cdot)$ denote the stale-belief mixture used in Mode C.
+If $\{p_z(\cdot)\}_z$ are linearly independent in $\R^{|\V|}$ (a standard mixture identifiability condition), then $p=\tilde p$ implies $\bvec_{c,t}=\bvec_c$.
+Without identifiability, equality can hold only in degenerate cases where different weights induce the same mixture (e.g., identical emissions).
 \end{proposition}
 \begin{proof}[Sketch]
-The exact conditional requires integrating over $z_c$ with weights $\bvec_{c,t}(z)=p(z_c=z\mid x,y_{<t})$.
-When $\ell_t(z)$ depends on $z$, Bayes rule \Cref{eq:token-filter} updates the weights after observing tokens, yielding $\bvec_{c,t}\ne \bvec_c$ except in degenerate cases (e.g., $\ell_t$ independent of $z$ or tokens carry no information about $z$).
+By definition,
+$p(\cdot)-\tilde p(\cdot)=\sum_z(\bvec_{c,t}(z)-\bvec_c(z))\,p_z(\cdot)$.
+If the emission vectors are linearly independent, the only coefficient vector yielding the zero vector is $\bvec_{c,t}-\bvec_c=0$.
 \end{proof}
 
 \section{Theoretical Properties for Concurrent Lookahead}
@@ -263,9 +273,9 @@ Compute $P^{2^j}$ by squaring: $P^{2^{j+1}}=(P^{2^j})^2$ for $j=0,\dots,\lfloor\
 Then express $k$ in binary and multiply the selected powers.
 \end{proof}
 
-\section{\APELR: Implementation as a State-Space Policy LM}
+\section{\APELR: Discrete Planner with Expert-Only Emission}
 \label{sec:apelr-arch}
-We now describe the repository implementation, emphasizing what is mathematically exact versus a deliberate engineering choice.
+We now describe the mainline repository implementation, emphasizing what is mathematically exact versus a deliberate engineering choice.
 
 \subsection{High-level architecture}
 \APELR{} consists of:
@@ -277,22 +287,11 @@ We now describe the repository implementation, emphasizing what is mathematicall
 The core design goal is bidirectional coupling:
 planner state influences token probabilities, and realized tokens update the planner state online (token filtering).
 
-\subsection{Model versions in this repository (V1 and V2)}
-\label{sec:model-versions}
-This repository implements two versioned architectures (\texttt{docs/model\_versions.md}):
-\begin{itemize}
-  \item \textbf{V1 (\texttt{v1\_filtered\_mixture}).}
-  A filtered-mixture architecture in which a shared emission head is conditioned on a learned plan embedding and a per-plan vocabulary bias (\texttt{src/apelr/model.py}).
-  The planner can be under-utilized because experts share substantial capacity.
-  \item \textbf{V2 (\texttt{v2\_planner\_required}).}
-  A planner-required architecture where token logits are produced by planner-conditioned expert heads only (\texttt{src/apelr/model\_v2.py}).
-  V2 also adds explicit planner diagnostics, forced-state interventions, and optional lookahead-to-emission feedback.
-\end{itemize}
-Both versions maintain an internal discrete belief state and can update it online from realized tokens (token filtering).
-V2 primarily tightens identifiability and train--inference alignment by removing a high-capacity bypass path and enforcing a causal chunk-boundary update shared by training and generation.
+\paragraph{Legacy note.}
+The repository contains a legacy filtered-mixture variant for historical comparison; throughout this paper, \APELR{} refers to the expert-only emission implementation in \texttt{src/apelr/model\_v2.py}.
 
 \subsection{Planner state: discrete latent belief}
-In \APELR{} V2, the planner state is a discrete distribution over \emph{latent} states (not literal tokens).
+In \APELR{}, the planner state is a discrete distribution over \emph{latent} states (not literal tokens).
 We denote the planner belief before emitting token $t{+}1$ by $\B_t\in\Delta^{K-1}$.
 In code, this is a length-$K$ tensor normalized by $\softmax$ (\texttt{model\_v2.py}).
 
@@ -326,24 +325,10 @@ Each expert $k\in\{1,\dots,K\}$ defines logits $a_{t,k}\in\R^{|\V|}$ and
 \[
 p_k(y\mid h_t) = \softmax(a_{t,k})_y.
 \]
-\paragraph{V1 emission parameterization.}
-In \APELR{} V1 (\texttt{src/apelr/model.py}), ``experts'' share most parameters and differ through a plan embedding and an explicit per-plan vocabulary bias:
-let $u_k\in\R^{d}$ be a learned plan embedding, and let $s_t=W_s h_t + b_s$.
-Then a plan-conditioned fusion feature is
-\[
-j_{t,k}=\tanh(s_t + W_p u_k),
-\]
-and the per-plan token logits are
-\[
-a_{t,k} = W_o\, j_{t,k} + b_o + v_k,
-\]
-where $v_k\in\R^{|\V|}$ is a learned vocabulary-bias vector for plan $k$.
-This realizes a filtered mixture-of-experts view \citep{shazeer2017moe}, but because parameters are heavily shared, the model can still reduce planner importance by collapsing plan embeddings/biases.
-
-\paragraph{V2 emission parameterization (planner-required).}
-In \APELR{} V2 (\texttt{src/apelr/model\_v2.py}), each plan state has its own linear head,
+\paragraph{Expert-only emission.}
+In \APELR{} (\texttt{src/apelr/model\_v2.py}), each planner state has its own linear head,
 $a_{t,k}=W_k h_t + b_k$.
-This removes a high-capacity shared bypass path and empirically increases intervention sensitivity (forced-state divergences) at comparable training budgets.
+This ``expert-only'' design removes a high-capacity shared bypass path and empirically increases planner intervention sensitivity (forced-state divergences) at comparable training budgets, while retaining a clean mixture-of-experts interpretation \citep{shazeer2017moe}.
 
 \subsection{Token-time filtering update (online coupling)}
 \label{sec:token-filtering}
@@ -355,6 +340,7 @@ When \texttt{token\_filtering=true}, the belief is updated after observing (or e
 \end{equation}
 where $\log p_{1:K}(y\mid h_t)$ denotes the vector of expert log-probabilities for token $y$.
 This is the discrete filtering recursion \Cref{eq:token-filter} when the model is interpreted as a discrete latent mixture with tractable emissions; in \APELR{} we adopt it as a causal internal state update (state-space policy).
+\footnote{If $\tau=1$ and $\lambda=0$ so that the emission gate equals the belief ($g_t=\B_t$), then \Cref{eq:apelr-token-update} coincides with the exact Bayesian filtering update for a discrete latent mixture. For $\tau\ne 1$ and/or $\lambda>0$, the update remains a valid causal state update but should not be interpreted as the exact posterior of the emitted mixture weights without an augmented generative story.}
 
 \subsection{Chunk-boundary update (causal boundary evidence)}
 \label{sec:boundary-update}
@@ -370,12 +356,12 @@ At the boundary after completing chunk $c$, the belief is updated by a transitio
 \end{equation}
 where $P\in\R^{K\times K}$ is a row-stochastic transition matrix and $\alpha$ is a context scale.
 This update is \emph{causal}: it depends only on information from the completed chunk.
-Importantly, training and generation both apply the same boundary update semantics in V2.
+Importantly, training and generation both apply the same boundary update semantics.
 
 \paragraph{Why ``previous chunk'' evidence matters.}
 A common pitfall in hierarchical latent LMs is using information from the \emph{current} chunk to update the chunk's plan state during training, while generation only has partial information mid-chunk.
 This creates a train--inference mismatch: the model learns to rely on evidence that does not exist at inference time.
-\APELR{} V2 avoids this by defining the boundary update strictly as a function of the \emph{previous} completed chunk summary.
+\APELR{} avoids this by defining the boundary update strictly as a function of the \emph{previous} completed chunk summary.
 The corresponding implementation is factored into a single helper used by both training and generation (\texttt{\_apply\_boundary\_update}).
 
 \subsection{Emission gate with lookahead feedback}
@@ -385,7 +371,7 @@ Given a current belief $\B_t$ and transition matrix $P$, the planner can forecas
 \B_t^{(s)} := \B_t P^s,\qquad s=1,\dots,H.
 \]
 Define the mean forecast $\bar{\B}_t := \frac{1}{H}\sum_{s=1}^{H}\B_t^{(s)}$.
-\APELR{} V2 defines a mixed belief used for gating:
+\APELR{} defines a mixed belief used for gating:
 \[
 \tilde{\B}_t := (1-\lambda)\B_t + \lambda \bar{\B}_t,\qquad \lambda\in[0,1],
 \]
@@ -417,12 +403,12 @@ This is no longer ``non-interfering,'' but it is precisely the mechanism that re
 The key requirement is causality: forecasts must depend only on past tokens and fixed parameters, not on unseen future tokens.
 
 \subsection{Async implementation in \APELR{}}
-In \APELR{} V2 generation (\texttt{generate\_planned}), lookahead computation can be offloaded to a background CPU thread:
+In \APELR{} generation (\texttt{generate\_planned}), lookahead computation can be offloaded to a background CPU thread:
 the executor performs GPU forward passes for token sampling while the planner thread computes matrix powers on CPU for the current belief (small $K$).
 The result is used only when it matches the current token position; otherwise the model falls back to synchronous computation.
 
 \begin{algorithm}[t]
-\caption{\APELR{} V2 generation with optional async lookahead}
+\caption{\APELR{} generation with optional async lookahead}
 \label{alg:gen}
 \begin{algorithmic}[1]
 \Require Prompt tokens $x$; maximum new tokens $N$; chunk size $m$; transition matrix $P$; horizon $H$; feedback $\lambda$.
@@ -452,27 +438,12 @@ Given a dataset of token sequences, training uses teacher forcing and optimizes 
 \end{equation}
 where $g_t$ is computed from the online planner state and (optionally) lookahead feedback.
 \paragraph{Train--inference alignment.}
-In \APELR{} V2, the loss computation follows the same online recursion as generation (including prompt ingestion semantics and causal boundary updates), addressing a common failure mode where training uses information unavailable at inference time.
+In \APELR{}, the loss computation follows the same online recursion as generation (including prompt ingestion semantics and causal boundary updates), addressing a common failure mode where training uses information unavailable at inference time.
 This alignment is unit-tested (\texttt{tests/test\_model\_v2\_alignment.py}).
-
-\subsection{V1 auxiliary losses}
-\label{sec:v1-losses}
-Although this report emphasizes V2 (planner-required), V1 implements several auxiliary terms that are useful for understanding the evolution of the design.
-Let $\B_t$ be the online belief and let $\bar u=\frac{1}{T}\sum_t \B_t$ be mean usage.
-V1 optionally includes:
-\begin{itemize}
-  \item \textbf{Belief entropy regularization:} encourages non-degenerate beliefs early in training,
-  $\mathcal{L}_{\mathrm{ent}} = \frac{1}{T}\sum_t H(\B_t)$.
-  \item \textbf{Usage balance:} penalizes state starvation, $\mathcal{L}_{\mathrm{usage}}=\KL(\bar u\,\|\,\mathrm{Unif})$.
-  \item \textbf{Chunk bag-of-words (BOW) prediction:} predicts the empirical chunk token histogram using a belief-weighted mixture of per-plan token distributions; this increases plan identifiability by forcing chunk-level lexical predictiveness.
-  \item \textbf{Mutual-information surrogate:} increases separability between per-plan token distributions by maximizing $H(p_{\mathrm{mix}})-\sum_k \B_t(k)H(p_k)$, encouraging distinct experts.
-  \item \textbf{Chunk posterior alignment:} aligns a chunk-summary ``recognizer'' posterior with the online-filtered posterior via a symmetric KL term.
-\end{itemize}
-These terms appear in \texttt{src/apelr/model.py} and are described in the accompanying technical notes (\texttt{architecture\_math\_log.txt}).
 
 \subsection{Discrete commitment and planner temperature}
 \label{sec:commitment}
-\APELR{} V2 supports two training-time regimes for the chunk-level planner state representation:
+\APELR{} supports two training-time regimes for the chunk-level planner state representation:
 \begin{itemize}
   \item \textbf{Soft commitment:} chunk states are the (soft) beliefs themselves.
   \item \textbf{Gumbel straight-through:} a hard one-hot state is sampled from the belief using a Gumbel--Softmax relaxation, with straight-through gradients \citep{jang2017gumbel,maddison2017concrete}.
@@ -480,14 +451,16 @@ These terms appear in \texttt{src/apelr/model.py} and are described in the accom
 Separately, the gate uses a planner temperature $\tau$ (see \Cref{eq:gate-softmax}) that controls how sharply beliefs are converted into mixture weights.
 In most runs in this repository, $\tau$ is linearly annealed from \texttt{plan\_temperature\_start} to \texttt{plan\_temperature\_end} over training steps.
 
-\subsection{V2 auxiliary losses}
+\subsection{Auxiliary losses}
 \label{sec:v2-losses}
 \paragraph{Usage balance.}
 Let $\bar u \in \Delta^{K-1}$ denote mean expert usage (averaged over chunks and batch).
 We penalize collapse via $\KL(\bar u\,\|\,\mathrm{Unif})$.
 
 \paragraph{Boundary entropy.}
-We optionally shape the entropy of chunk-start posteriors to avoid overly peaky beliefs early in training.
+We regularize the entropy of chunk-start posteriors
+$H(\B)= -\sum_k \B(k)\log(\B(k){+}\varepsilon)$.
+In the current implementation, this term is added to the loss with a positive weight, which encourages \emph{lower} entropy (sharper chunk beliefs) and thus stronger expert commitment; flipping the sign encourages more diffuse beliefs early in training.
 
 \paragraph{Future contrastive objective (InfoNCE).}
 Let $v_c$ be a plan embedding derived from planner state at chunk $c$ and let $f_{c+d}$ be a representation of a future chunk summary (projected).
@@ -508,8 +481,8 @@ We include a windowed unlikelihood penalty on repeating recent tokens:
 \]
 for tokens $u$ appearing recently in the context but not equal to the ground-truth target \citep{welleck2020unlikelihood}.
 
-\paragraph{Total V2 loss.}
-The V2 objective used in this repository is:
+\paragraph{Total loss.}
+The objective used in this repository is:
 \begin{equation}
 \label{eq:v2-total}
 \mathcal{L}
@@ -530,38 +503,6 @@ To measure whether the planner is functionally used, \APELR{} reports:
   \item \textbf{Expert utilization:} normalized entropy of mean usage (1 = uniform usage).
   \item \textbf{Feedback delta:} NLL difference between $\lambda>0$ and $\lambda=0$ lookahead feedback.
 \end{itemize}
-
-\section{Implementation Notes and Pitfalls}
-\label{sec:pitfalls}
-This section summarizes practical issues that matter for making \APEL{}-style models behave as intended.
-
-\subsection{Train--inference mismatch at chunk boundaries}
-The most common correctness failure for chunk-latent filtering architectures is to update the chunk plan using information that is not available at inference time.
-In particular, updating a chunk plan $z_c$ (or its belief) using a summary of chunk $c$ while still generating tokens \emph{inside} chunk $c$ leaks information under teacher forcing.
-\APELR{} V2 adopts a strict rule: the chunk-boundary update uses only the \emph{previous} completed chunk summary (see \Cref{sec:boundary-update}).
-
-\subsection{Prompt ingestion must update the planner state}
-If generation does not update the planner belief while consuming the prompt, the planner starts generation from an uninformed prior, which weakens planner influence and makes forced-state interventions less interpretable.
-\APELR{} V2 therefore applies token filtering updates during prompt ingestion when enabled.
-
-\subsection{Off-by-one boundary semantics}
-Chunk indexing is subtle because the executor processes input tokens while predicting targets shifted by one position.
-V2 loss computation explicitly aligns chunk boundaries to \emph{target tokens} so that the boundary update occurs exactly when the generated stream crosses a chunk boundary (the same moment generation would apply it).
-This alignment is unit-tested by comparing batch loss to a step-by-step teacher-forcing recursion mirroring generation semantics.
-
-\subsection{Asynchronous lookahead staleness}
-Lookahead forecasts computed at token position $t$ are valid priors conditioned on the belief available at $t$.
-However, if the belief changes rapidly within a chunk (e.g., because expert likelihoods are sharp), a forecast can become stale within a few tokens.
-\APELR{} mitigates this by attaching forecasts to a specific token position and discarding mismatched asynchronous results.
-
-\subsection{Decoding heuristics can mask modeling failures}
-Top-$k$/top-$p$ sampling, repetition penalties, and no-repeat $n$-gram blocking often improve perceived text quality, but they can also hide degeneracies such as expert specialization into trivial loops.
-In particular, character-level models are extremely sensitive to $n$-gram blocking (the effective constraint is much stronger than in BPE settings).
-We recommend reporting diagnostics that do not depend on decoding heuristics (e.g., planner mask delta, forced-state divergences).
-
-\subsection{Non-fatal dataset shutdown warning}
-Some runs emit a shutdown-time warning from \texttt{datasets}/\texttt{multiprocess.resource\_tracker} on Windows.
-Empirically this has not affected checkpoint/metrics correctness, but it can be distracting; treat it as an environment quirk rather than a training failure unless files are missing.
 
 \section{Experimental Methodology}
 \label{sec:methodology}
@@ -597,12 +538,51 @@ The training loop (\texttt{src/apelr/train.py}) uses:
 
 \subsection{Evaluation protocol}
 Validation metrics are computed on a fixed number of validation batches (\texttt{val\_batches}) at an interval (\texttt{eval\_interval}).
-For V2 models, evaluation also computes planner diagnostics (mask deltas, forced-state divergences, utilization) and the lookahead feedback delta (\Cref{sec:v2-losses}).
+For \APELR{}, evaluation also computes planner diagnostics (mask deltas, forced-state divergences, utilization) and the lookahead feedback delta (\Cref{sec:v2-losses}).
 The training loop can also periodically generate a preview sample with nucleus/top-$k$ sampling \citep{holtzman2020degeneration}.
 
 \subsection{Hardware}
-All CUDA runs reported here were executed on a laptop GPU:
-NVIDIA GeForce RTX 4070 Laptop GPU (8\,GB VRAM).
+All CUDA runs reported here were executed on a single laptop GPU:
+NVIDIA GeForce RTX 4070 Laptop GPU (8\,GB VRAM), using PyTorch 2.6.0 (\texttt{+cu124}) with CUDA runtime 12.4 and fp16 autocast.
+
+\subsection{Compute and FLOPs (Transformer-style reporting)}
+\label{sec:compute}
+We report rough forward-pass floating point operation (FLOP) counts and memory probes in the style of standard Transformer papers \citep{vaswani2017attention}.
+Unless noted, FLOPs count multiply--add as 2 FLOPs and ignore layernorm/nonlinearities.
+
+\paragraph{\APELR{} (GRU + $K$ expert heads).}
+For a GRU layer with input size $I$ and hidden size $H$, the dominant per-token cost is approximately
+$6H(I{+}H)$ FLOPs (3 gates, input-to-hidden and hidden-to-hidden).
+With $L$ GRU layers, the backbone cost is $\sum_{\ell=1}^{L}6H(I_\ell{+}H)$.
+Expert emission uses $K$ linear heads $W_k\in\R^{|\V|\times H}$, costing approximately $2K|\V|H$ FLOPs per token.
+Planner belief updates and $K\times K$ lookahead are negligible at the reported $K=8$.
+
+\paragraph{Transformer baseline.}
+For a decoder-only Transformer with model width $d$, sequence length $T$, and $L$ layers, a rough per-token forward cost is:
+per layer, $24d^2 + 4Td$ FLOPs (QKV/out projections + MLP + attention matmuls), plus a final LM head cost $2|\V|d$.
+
+\paragraph{Numbers for the WikiText-2 configs (seq\_len 96).}
+For the WikiText-2 BPE2048 smoke configs (\texttt{configs/wikitext2\_*\_cuda\_4070m\_bpe2048\_smoke.yaml}),
+this yields $\approx 36.96$M FLOPs/token for \APELR{} (GRU(256$\rightarrow$768)$\times$2 + $K{=}8$ experts) and $\approx 32.05$M FLOPs/token for the 2-layer Transformer ($d{=}768$, $h{=}8$) under $T{=}96$.
+With adaptive batch sizing (cap 8) and gradient accumulation 2, the effective tokens per optimizer step are $8\times 96\times 2=1536$; the WikiText-2 smoke runs train for 80 steps (total $\approx 1.23\times 10^5$ tokens).
+Ignoring auxiliary losses and using a standard $3\times$ multiplier for forward+backward, the total training compute is on the order of 13.6 TFLOPs for \APELR{} and 11.8 TFLOPs for the Transformer.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}l r r r r@{}}
+\toprule
+Model & Params & FLOPs/token (fwd) & Peak mem/sample (fp16 train) & Titans eval time \\
+\midrule
+\APELR{} & 19.64M & 36.96M & 233.6 MiB & 69.1 min \\
+Transformer & 17.39M & 32.05M & 153.7 MiB & 3.0 min \\
+\bottomrule
+\end{tabular}
+\caption{Compute and resource summary for the WikiText-2 BPE2048 smoke checkpoints.
+FLOPs/token are rough forward-pass estimates excluding auxiliary losses; peak memory per sample is from the adaptive-batch probe (fp16 forward+backward).
+Titans eval time is the wall-clock time to run \Cref{sec:std-evals} for one checkpoint on the reported hardware (excluding dataset download); \APELR{} timing reflects a correct but unoptimized Python-level per-token belief recursion.}
+\label{tab:compute-summary}
+\end{table}
 
 \subsection{Datasets}
 We report experiments on:
@@ -615,35 +595,34 @@ We report experiments on:
 \label{sec:experiments}
 \subsection{Language modeling and planner utilization}
 \Cref{tab:main-results} summarizes representative runs.
-For V2 runs, planner diagnostics indicate that the planner state materially affects emission (mask deltas and forced-state divergences are nontrivial), even at modest training horizons.
+For \APELR{} runs, planner diagnostics indicate that the planner state materially affects emission (mask deltas and forced-state divergences are nontrivial), even at modest training horizons.
 
 \paragraph{Run configurations.}
 For reproducibility, key runs correspond to:
 \begin{itemize}
-  \item \texttt{tinystories\_iter}: V1 char-level run from \texttt{configs/tinystories\_iter.yaml} (longer CPU baseline).
-  \item \texttt{tinystories\_v2\_cuda\_4070m}: V2 char-level CUDA run from \texttt{configs/tinystories\_v2\_cuda\_4070m.yaml} (seq\_len 128, 220 steps, fp16, grad accumulation 2).
-  \item \texttt{v2\_4070\_iter4\_bpe512}: V2 BPE512 CUDA run from \texttt{configs/local/v2\_4070\_iter4\_bpe512.yaml} (hidden 512, 300 steps, fp16, grad accumulation 2).
-  \item \texttt{wikitext2\_v2\_cuda\_4070m\_bpe2048\_smoke}: V2 BPE2048 CUDA smoke from \texttt{configs/wikitext2\_v2\_cuda\_4070m\_bpe2048\_smoke.yaml} (seq\_len 96, 80 steps).
+  \item \texttt{tinystories\_v2\_cuda\_4070m}: char-level CUDA run from \texttt{configs/tinystories\_v2\_cuda\_4070m.yaml} (seq\_len 128, 220 steps, fp16, grad accumulation 2).
+  \item \texttt{v2\_4070\_iter4\_bpe512}: BPE512 CUDA run from \texttt{configs/local/v2\_4070\_iter4\_bpe512.yaml} (hidden 512, 300 steps, fp16, grad accumulation 2).
+  \item \texttt{tinystories\_v2\_fastiter\_a1}: BPE4096 CUDA run from \texttt{configs/local/v2\_tinystories\_cuda\_fast.yaml} (39M params, 120 steps).
+  \item \texttt{tinystories\_v2\_xl\_a2}: BPE8192 CUDA run from \texttt{configs/local/v2\_tinystories\_cuda\_xl.yaml} (88M params; longer-horizon TinyStories run).
+  \item \texttt{wikitext2\_v2\_cuda\_4070m\_bpe2048\_smoke}: BPE2048 CUDA smoke from \texttt{configs/wikitext2\_v2\_cuda\_4070m\_bpe2048\_smoke.yaml} (seq\_len 96, 80 steps).
 \end{itemize}
-All V2 CUDA runs use adaptive batch sizing to fit 8\,GB VRAM.
+All CUDA runs use adaptive batch sizing to fit 8\,GB VRAM.
 
 \begin{table}[t]
 \centering
 \small
-\begin{tabular}{@{}l l r r r r r@{}}
+\begin{tabular}{@{}l r r r r r@{}}
 \toprule
-Run & Model & Params & Vocab & Val PPL & Mask $\Delta$ & Force $\JS$ \\
+Run & Params & Vocab & Val PPL & Mask $\Delta$ & Force $\JS$ \\
 \midrule
-tinystories\_iter & V1 & 4.69M & 96 & 5.84 & -- & -- \\
-tinystories\_smoke & V1 & 3.06M & 84 & 9.47 & -- & -- \\
-tinystories\_bpe\_ident\_iter & V1 & 5.32M & 1024 & 116.13 & -- & -- \\
-\midrule
-tinystories\_v2\_cuda\_4070m & V2 & 7.18M & 104 & 10.64 & 0.521 & 0.692 \\
-v2\_4070\_iter4\_bpe512 & V2 & 5.13M & 512 & 57.62 & 0.164 & 0.209 \\
-wikitext2\_v2\_cuda\_4070m\_bpe2048\_smoke & V2 & 19.64M & 2048 & 714.64 & 0.096 & 0.213 \\
+tinystories\_v2\_cuda\_4070m & 7.18M & 104 & 10.64 & 0.521 & 0.692 \\
+v2\_4070\_iter4\_bpe512 & 5.13M & 512 & 57.62 & 0.164 & 0.209 \\
+tinystories\_v2\_fastiter\_a1 & 39.07M & 4096 & 397.23 & -0.008 & 0.328 \\
+tinystories\_v2\_xl\_a2 & 88.43M & 8192 & 382.29 & 0.008 & 0.039 \\
+wikitext2\_v2\_cuda\_4070m\_bpe2048\_smoke & 19.64M & 2048 & 714.64 & 0.096 & 0.213 \\
 \bottomrule
 \end{tabular}
-\caption{Representative validation results from \texttt{runs/*/metrics.json}. Mask $\Delta$ is the NLL increase when replacing planner gating with a uniform gate (planner removed). Force $\JS$ is the JS divergence between forced planner states (intervention diagnostic).}
+\caption{Representative validation results from \texttt{runs/*/metrics.json}. Absolute PPL values are not directly comparable across different tokenizations and training horizons; Mask $\Delta$ and Force $\JS$ are used as coupling diagnostics. Mask $\Delta$ is the NLL increase when replacing planner gating with a uniform gate (planner removed). Force $\JS$ is the JS divergence between forced planner states (intervention diagnostic).}
 \label{tab:main-results}
 \end{table}
 
@@ -657,18 +636,73 @@ Run & usageKL & bndEnt & planJS & mask$\Delta$ & forceJS & util & fb$\Delta$ \\
 v2\_4070\_iter1 & 0.822 & 0.920 & 0.625 & 0.597 & 0.689 & 0.605 & -- \\
 tinystories\_v2\_cuda\_4070m & 0.678 & 0.916 & 0.583 & 0.521 & 0.692 & 0.674 & 0.137 \\
 v2\_4070\_iter4\_bpe512 & 0.057 & 1.908 & 0.281 & 0.164 & 0.209 & 0.972 & -- \\
+tinystories\_v2\_fastiter\_a1 & 0.079 & 2.190 & 0.379 & -0.008 & 0.328 & 0.966 & -- \\
+tinystories\_v2\_xl\_a2 & 0.257 & 2.192 & 0.047 & 0.008 & 0.039 & 0.897 & -- \\
 wikitext2\_v2\_cuda\_4070m\_bpe2048\_smoke & 0.403 & 1.329 & 0.394 & 0.096 & 0.213 & 0.806 & 0.101 \\
 \bottomrule
 \end{tabular}
-\caption{V2 planner diagnostics (selected columns) from \texttt{runs/*/metrics.json}. \texttt{usageKL}: KL to uniform usage; \texttt{bndEnt}: boundary entropy; \texttt{planJS}: mean pairwise expert JS; \texttt{mask$\Delta$}: planner mask delta; \texttt{forceJS}: forced-state divergence; \texttt{util}: expert utilization (normalized entropy of usage); \texttt{fb$\Delta$}: NLL improvement from lookahead feedback (when recorded).}
+\caption{\APELR{} planner diagnostics (selected columns) from \texttt{runs/*/metrics.json}. \texttt{usageKL}: KL to uniform usage; \texttt{bndEnt}: boundary entropy; \texttt{planJS}: mean pairwise expert JS; \texttt{mask$\Delta$}: planner mask delta; \texttt{forceJS}: forced-state divergence; \texttt{util}: expert utilization (normalized entropy of usage); \texttt{fb$\Delta$}: NLL improvement from lookahead feedback (when recorded).}
 \label{tab:v2-metrics}
 \end{table}
+
+\subsection{Standardized zero-shot benchmarks (Titans suite)}
+\label{sec:std-evals}
+To compare \APELR{} against a decoder-only Transformer baseline using standardized evaluation datasets, we ran a small suite aligned with the benchmarks reported in \emph{Titans: Learning to Memorize at Test Time} \citep{behrouz2025titans}.
+We evaluate perplexity on WikiText \citep{merity2016wikitext} and LAMBADA \citep{paperno2016lambada}, and zero-shot multiple-choice accuracy on PIQA \citep{bisk2019piqa}, HellaSwag \citep{zellers2019hellaswag}, ARC-Easy/Challenge \citep{clark2018arc}, WinoGrande (XL) \citep{sakaguchi2020winogrande}, SocialIQA \citep{sap2019socialiqa}, and BoolQ \citep{clark2019boolq}; we additionally include OpenBookQA \citep{mihaylov2018openbookqa}.
+Under the \texttt{Salesforce/wikitext} loader, the raw v1 \emph{test} splits for WikiText-2 and WikiText-103 are identical; we report both for compatibility with Titans-style tables.
+Both models were trained on WikiText-2 with the same byte-level BPE tokenizer (vocab 2048) and evaluated in a zero-shot manner by scoring continuations with teacher-forced log-likelihood.
+For multiple-choice tasks, we report both raw accuracy (\texttt{acc}) and length-normalized accuracy (\texttt{acc\_norm}), where choices are scored by (i) the sum of token log-probabilities in the continuation and (ii) the mean per-token log-probability, respectively.
+To keep evaluation comparable given the Transformer's fixed \texttt{max\_seq\_len}, we truncated inputs to a maximum length of 96 tokens (\texttt{--max-input-len 96}).
+All raw metrics (including example counts and per-task runtimes) are recorded in \texttt{runs/eval\_titans\_full\_wikitext2\_apel\_vs\_transformer.json}.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}l l r r@{}}
+\toprule
+Benchmark & Metric & \APELR{} & Transformer \\
+\midrule
+WikiText-2 (test) \citep{merity2016wikitext} & PPL $\downarrow$ & 715.219 & 511.030 \\
+WikiText-103 (test) \citep{merity2016wikitext} & PPL $\downarrow$ & 715.219 & 511.030 \\
+LAMBADA (OpenAI) \citep{paperno2016lambada} & PPL $\downarrow$ & 1036.931 & 841.255 \\
+LAMBADA (OpenAI) \citep{paperno2016lambada} & Acc$_{\text{1tok}}\uparrow$ & 0.000 & 0.000 \\
+\bottomrule
+\end{tabular}
+\caption{Perplexity-style evaluation on Titans-aligned benchmarks for two WikiText-2-trained checkpoints (seq\_len 96). ``Acc$_{\text{1tok}}$'' for LAMBADA is computed on examples where the target final word is a single token under the learned BPE tokenizer.}
+\label{tab:titans-ppl}
+\end{table}
+
+\begin{table}[t]
+\centering
+\scriptsize
+\begin{tabular}{@{}l r rr rr@{}}
+\toprule
+Task & $N$ & \multicolumn{2}{c}{\APELR{}} & \multicolumn{2}{c}{Transformer} \\
+ &  & Acc$\uparrow$ & Acc$_{\text{norm}}\uparrow$ & Acc$\uparrow$ & Acc$_{\text{norm}}\uparrow$ \\
+\midrule
+PIQA \citep{bisk2019piqa} & 1838 & 0.516 & 0.497 & 0.516 & 0.492 \\
+HellaSwag \citep{zellers2019hellaswag} & 10042 & 0.256 & 0.250 & 0.255 & 0.244 \\
+ARC-Easy \citep{clark2018arc} & 570 & 0.275 & 0.272 & 0.275 & 0.274 \\
+ARC-Challenge \citep{clark2018arc} & 299 & 0.187 & 0.197 & 0.181 & 0.221 \\
+WinoGrande-XL \citep{sakaguchi2020winogrande} & 1267 & 0.497 & 0.503 & 0.502 & 0.509 \\
+SocialIQA \citep{sap2019socialiqa} & 1954 & 0.334 & 0.309 & 0.332 & 0.325 \\
+BoolQ \citep{clark2019boolq} & 3270 & 0.378 & 0.622 & 0.378 & 0.622 \\
+OpenBookQA \citep{mihaylov2018openbookqa} & 500 & 0.142 & 0.230 & 0.142 & 0.238 \\
+\bottomrule
+\end{tabular}
+\caption{Zero-shot multiple-choice evaluation (teacher-forced scoring) on Titans-aligned benchmarks \citep{behrouz2025titans}. Acc$_{\text{norm}}$ denotes length-normalized scoring (mean log-prob per continuation token).}
+\label{tab:titans-mc}
+\end{table}
+
+\paragraph{Interpretation.}
+These checkpoints are intentionally small and under-trained (80 optimizer steps on $\approx 1.23\times 10^5$ tokens; \Cref{sec:compute}), so absolute benchmark performance is near chance on many tasks.
+We primarily use this suite as a standardized sanity check and a like-for-like comparison between \APELR{} and a Transformer under identical data, tokenizer, and compute budgets.
 
 \subsection{Ablations: token filtering and lookahead feedback}
 \label{sec:ablations}
 Two toggles directly test the ``think/speak coupling'' mechanisms:
 (i) token filtering updates \Cref{eq:apelr-token-update}, and (ii) lookahead-to-emission feedback \Cref{eq:gate-softmax}.
-\Cref{tab:ablation} reports controlled ablations on held-out subsets (10 validation batches, batch size 4) for two V2 checkpoints.
+\Cref{tab:ablation} reports controlled ablations on held-out subsets (10 validation batches, batch size 4) for two \APELR{} checkpoints.
 In the latent-mixture interpretation, disabling token filtering corresponds to the stale-belief approximation (Mode C in \Cref{sec:inference-modes}) within each chunk; the measured loss increases quantify the cost of that approximation in these runs.
 
 \begin{table}[t]
@@ -691,45 +725,72 @@ Checkpoint & Setting & Val loss & Val PPL & $\Delta$ loss \\
 \label{tab:ablation}
 \end{table}
 
-\subsection{Qualitative planner interventions}
-\label{sec:qualitative}
-To qualitatively probe whether planner states represent distinct modes, \APELR{} V2 supports forced-state generation (\texttt{--force-state} in \texttt{apelr.sample}).
-In the BPE512 TinyStories run, forcing different states changes surface statistics (e.g., pronoun choices and local phrasing), consistent with the nonzero forced-state divergence.
-Conversely, very short or under-regularized runs can exhibit degenerate expert specializations (e.g., a state that emits punctuation repetitively), highlighting the need for balancing losses (\Cref{sec:limitations}).
+\section{Scaling Roadmap}
+\label{sec:scaling}
+The current experiments are primarily intended to validate the \emph{mechanisms} required for ``think while speak'' (online filtering, expert gating, and forecast coupling) at small/medium scale on a single laptop GPU.
+To match the presentation standards of modern architecture papers, the next phase of this project is a multi-scale training sweep up to $\sim$1B parameters with consistent tokenization, token budgets, and standardized evaluation.
 
-\paragraph{Example: forced-state outputs (BPE512 TinyStories, V2).}
-Below are two samples from the same checkpoint and prompt with different forced planner states (illustrative; the model is under-trained, so spelling/grammar are imperfect).
+\paragraph{Engineering prerequisites.}
+Before spending large compute, three implementation issues must be addressed:
+(i) remove Python-level per-token overhead in the teacher-forced belief recursion used in training/eval,
+(ii) batch and accelerate standardized evaluation (multiple-choice scoring), and
+(iii) add distributed training (e.g., FSDP/DDP) and sharded checkpointing for $\gtrsim$300M parameters.
 
-\begin{verbatim}
-Prompt: "Once upon a time"
+\paragraph{Scaling design choice: output-head cost.}
+\APELR{} uses an expert-only emission head with $K$ state-conditional token distributions, which scales output-head compute roughly linearly in $K$.
+For large-scale runs we therefore plan to keep $K$ small (e.g., $K\in\{2,4\}$) and/or introduce a factorized expert head that preserves planner dependence without multiplying the full vocab projection.
 
-force_state=0:
-Once upon a time. They were not houens the big. Theoed and gurs and a rele.
-They wughed and wugpped. The wunh lats the fryds the mater and started. They
-are a big eoth sturic. They had a big shall in the new faty and stight in the
-borts. She glhed and the aach suns and soce. They saw a big not the drehk and
-the arao and a big
-
-force_state=1:
-Once upon a time to didn't play for. She trating to go to outlse he patinter
-what it. He had did not was helped and but they wanted to go. He wanted to
-lach, she couldn't stry. She wanted to knry, they thought she make anye bitch
-he could had let't oowed. They cows it mry it. She could noted to have fun.
-He was so kny hrave it so go to herld some dow. She did't c
-\end{verbatim}
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}r r r r r l@{}}
+\toprule
+Params & Vocab & $K$ & Seq len & Tokens & Notes \\
+\midrule
+25M & 16k & 4 & 1024 & 1B & single node pilot \\
+60M & 16k & 4 & 2048 & 3B & ablations + throughput \\
+120M & 32k & 4 & 2048 & 6B & long-context eval \\
+300M & 32k & 4 & 4096 & 10B & multi-GPU recommended \\
+1B & 32k & 4 & 4096--8192 & 30B & distributed (FSDP) \\
+\bottomrule
+\end{tabular}
+\caption{Proposed scaling sweep (illustrative). All runs should report tokens trained, throughput (tokens/sec), peak memory, and planner diagnostics in addition to loss/perplexity.}
+\label{tab:scaling}
+\end{table}
 
 \section{Related Work}
 \label{sec:related}
-\APEL{} sits at the intersection of hierarchical latent sequence models, state-space filtering, and mixture-of-experts language modeling.
-Chunk-level discrete latents with Markov transitions are closely related to HMM-style models \citep{rabiner1989hmm} and their neural variants, while the executor is a standard autoregressive sequence model (here, a GRU \citep{cho2014gru}).
-The use of multiple expert emission distributions gated by a learned controller connects directly to mixture-of-experts layers \citep{shazeer2017moe}.
-\APELR{}'s token filtering update can be seen as a differentiable discrete filtering step when emissions are tractable, and as an internal policy-state update more generally.
-The future contrastive objective is a direct application of contrastive predictive coding / InfoNCE-style representation learning \citep{oord2018cpc}.
-Finally, repetition unlikelihood \citep{welleck2020unlikelihood} and nucleus sampling \citep{holtzman2020degeneration} are standard techniques for stabilizing generation and avoiding degenerative loops.
+\APEL{} sits at the intersection of hierarchical latent sequence models, state-space filtering, and modern autoregressive LMs.
+Our emphasis is not a new attention mechanism per se, but a \emph{causal factorization and execution schedule} that makes concurrent ``planner'' computation well-defined.
+
+\paragraph{Transformers and large-scale language modeling.}
+The dominant baseline for next-token prediction is the decoder-only Transformer \citep{vaswani2017attention} and its many incremental variants (sometimes informally referred to as ``Transformer++'').
+\APEL{} is compatible with Transformer executors, but the key novelty here is explicit separation of a slow plan state from fast token emission.
+
+\paragraph{Linear-time sequence models and state space methods.}
+Recent work has explored replacing quadratic attention with linear-time mechanisms, including retention-style recurrences \citep{sun2023retentivenetworksuccessortransformer}, selective state space models \citep{gu2024mambalineartimesequencemodeling}, and gated linear attention \citep{yang2024gatedlinearattentiontransformers}.
+Delta-rule updates have been proposed as an efficient way to parallelize certain linear-attention dynamics \citep{yang2025parallelizinglineartransformersdelta}, and gated delta networks combine delta-style updates with modern SSMs \citep{yang2025gateddeltanetworksimproving}.
+These lines of work primarily target \emph{sequence modeling efficiency}; \APEL{} instead targets \emph{concurrency of planning and speaking} via a chunk-latent belief and lookahead priors, and can in principle be paired with SSM- or linear-attention executors.
+
+\paragraph{Test-time memory and adaptation.}
+Architectures that allocate extra compute at inference time for memory or adaptation (rather than only at training time) are closely related in spirit.
+Titans \citep{behrouz2025titans} studies test-time memory mechanisms for LMs, and recent work explores end-to-end test-time training specifically for long-context settings \citep{tandon2025endtoendtesttimetraininglong}.
+\APEL{} differs in that the planner computation is designed to run \emph{concurrently} with token emission without violating causality, and its non-interference claims are explicit under the model factorization.
+
+\paragraph{Filtering with hierarchical latents.}
+Chunk-level discrete latents with Markov transitions are closely related to HMM-style filtering \citep{rabiner1989hmm} and their neural variants.
+\APEL{} can be viewed as an HMM-like filtering recursion where emissions are themselves autoregressive within each chunk.
+
+\paragraph{Mixture-of-experts and gating.}
+Gating multiple expert emission distributions connects to mixture-of-experts models \citep{shazeer2017moe}; \APELR{} uses a small $K$-expert emission head controlled by an online planner belief.
+
+\paragraph{Auxiliary objectives and decoding heuristics.}
+The future contrastive objective is a direct application of InfoNCE-style representation learning \citep{oord2018cpc}.
+Repetition unlikelihood \citep{welleck2020unlikelihood} and nucleus sampling \citep{holtzman2020degeneration} are standard techniques for stabilizing generation and avoiding degenerative loops in small models.
 
 \section{Discussion}
 \subsection{What is ``planning'' here?}
-In \APELR{} V2, the planner is a \emph{latent} discrete state distribution used to gate experts.
+In \APELR{}, the planner is a \emph{latent} discrete state distribution used to gate experts.
 It is not literal token planning.
 The planner can be interpreted as encoding mode variables such as style, discourse act, or short-horizon intent---but in the current prototype it is learned purely from next-token prediction pressure and auxiliary losses, without external plan supervision.
 
@@ -750,7 +811,7 @@ Lookahead uses only the transition matrix $P$ and does not condition on unknown 
 Thus, it is properly interpreted as a \emph{prior} forecast; treating it as a posterior forecast would be incorrect.
 
 \paragraph{Backbone not directly conditioned on planner state.}
-In the current V2 implementation, the planner influences token probabilities via the output gate but does not directly condition GRU hidden dynamics.
+In the current implementation, the planner influences token probabilities via the output gate but does not directly condition GRU hidden dynamics.
 A plan-conditioned backbone (injecting planner state into the recurrent update) is a plausible next step.
 
 \section{Reproducibility}
@@ -769,7 +830,68 @@ Unit tests can be run with:
 Preliminary experiments show measurable planner utilization and clear intervention sensitivity; ablations indicate that token filtering and lookahead feedback can both reduce loss under the trained policy.
 The prototype also exposes key tradeoffs (collapse vs. degenerate specialization) that motivate further work on identifiability, backbone conditioning, and more faithful lookahead under boundary evidence.
 
-\bibliographystyle{plainnat}
+\bibliographystyle{unsrtnat}
 \bibliography{references}
+
+\appendix
+
+\section{Implementation Notes and Pitfalls}
+\label{sec:pitfalls}
+This appendix summarizes practical issues that matter for making \APEL{}-style models behave as intended.
+
+\subsection{Train--inference mismatch at chunk boundaries}
+The most common correctness failure for chunk-latent filtering architectures is to update the chunk plan using information that is not available at inference time.
+In particular, updating a chunk plan $z_c$ (or its belief) using a summary of chunk $c$ while still generating tokens \emph{inside} chunk $c$ leaks information under teacher forcing.
+\APELR{} adopts a strict rule: the chunk-boundary update uses only the \emph{previous} completed chunk summary (see \Cref{sec:boundary-update}).
+
+\subsection{Prompt ingestion must update the planner state}
+If generation does not update the planner belief while consuming the prompt, the planner starts generation from an uninformed prior, which weakens planner influence and makes forced-state interventions less interpretable.
+\APELR{} therefore applies token filtering updates during prompt ingestion when enabled.
+
+\subsection{Off-by-one boundary semantics}
+Chunk indexing is subtle because the executor processes input tokens while predicting targets shifted by one position.
+The loss computation explicitly aligns chunk boundaries to \emph{target tokens} so that the boundary update occurs exactly when the generated stream crosses a chunk boundary (the same moment generation would apply it).
+This alignment is unit-tested by comparing batch loss to a step-by-step teacher-forcing recursion mirroring generation semantics.
+
+\subsection{Asynchronous lookahead staleness}
+Lookahead forecasts computed at token position $t$ are valid priors conditioned on the belief available at $t$.
+However, if the belief changes rapidly within a chunk (e.g., because expert likelihoods are sharp), a forecast can become stale within a few tokens.
+\APELR{} mitigates this by attaching forecasts to a specific token position and discarding mismatched asynchronous results.
+
+\subsection{Decoding heuristics can mask modeling failures}
+Top-$k$/top-$p$ sampling, repetition penalties, and no-repeat $n$-gram blocking often improve perceived text quality, but they can also hide degeneracies such as expert specialization into trivial loops.
+In particular, character-level models are extremely sensitive to $n$-gram blocking (the effective constraint is much stronger than in BPE settings).
+We recommend reporting diagnostics that do not depend on decoding heuristics (e.g., planner mask delta, forced-state divergences).
+
+\subsection{Non-fatal dataset shutdown warning}
+Some runs emit a shutdown-time warning from \texttt{datasets}/\texttt{multiprocess.resource\_tracker} on Windows.
+Empirically this has not affected checkpoint/metrics correctness, but it can be distracting; treat it as an environment quirk rather than a training failure unless files are missing.
+
+\section{Qualitative Planner Interventions}
+\label{sec:qualitative}
+To qualitatively probe whether planner states represent distinct modes, \APELR{} supports forced-state generation (\texttt{--force-state} in \texttt{apelr.sample}).
+In the BPE512 TinyStories run, forcing different states changes surface statistics (e.g., local phrasing), consistent with the nonzero forced-state divergence.
+Conversely, very short or under-regularized runs can exhibit degenerate expert specializations (e.g., a state that emits punctuation repetitively), highlighting the need for balancing losses (\Cref{sec:limitations}).
+
+\paragraph{Example: forced-state outputs (BPE512 TinyStories).}
+Below are two samples from the same checkpoint and prompt with different forced planner states (illustrative; the model is under-trained, so spelling/grammar are imperfect).
+
+\begin{verbatim}
+Prompt: "Once upon a time"
+
+force_state=0:
+Once upon a time. They were not houens the big. Theoed and gurs and a rele.
+They wughed and wugpped. The wunh lats the fryds the mater and started. They
+are a big eoth sturic. They had a big shall in the new faty and stight in the
+borts. She glhed and the aach suns and soce. They saw a big not the drehk and
+the arao and a big
+
+force_state=1:
+Once upon a time to didn't play for. She trating to go to outlse he patinter
+what it. He had did not was helped and but they wanted to go. He wanted to
+lach, she couldn't stry. She wanted to knry, they thought she make anye bitch
+he could had let't oowed. They cows it mry it. She could noted to have fun.
+He was so kny hrave it so go to herld some dow. She did't c
+\end{verbatim}
 
 \end{document}
