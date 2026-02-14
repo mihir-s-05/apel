@@ -48,6 +48,15 @@ datasets/
 # Logs
 *.log
 
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.out
+*.toc
+*.synctex.gz
+*.pdf
+
 # Local experimental configs
 configs/local/
 configs/*_scratch.yaml
