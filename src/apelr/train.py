@@ -142,6 +142,29 @@ def load_config(path: str | Path) -> dict[str, Any]:
     return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
 
+def _apply_overrides(cfg: dict[str, Any], overrides: list[str]) -> dict[str, Any]:
+    """Apply dotted-path overrides, e.g. ``train.lr=0.0003``."""
+    import ast as _ast
+
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError(f"Override must be key=value, got: {item!r}")
+        key, raw_value = item.split("=", 1)
+        parts = key.split(".")
+        node = cfg
+        for part in parts[:-1]:
+            if part not in node:
+                node[part] = {}
+            node = node[part]
+        # auto-cast to int / float / bool / None when possible
+        try:
+            value = _ast.literal_eval(raw_value)
+        except (ValueError, SyntaxError):
+            value = raw_value
+        node[parts[-1]] = value
+    return cfg
+
+
 def file_sha256(path: str | Path) -> str:
     data = Path(path).read_bytes()
     return hashlib.sha256(data).hexdigest()
@@ -794,9 +817,14 @@ def build_loaders(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train APEL-R model.")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config.")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from.")
+    parser.add_argument("--set", dest="overrides", nargs="*", default=[],
+                        help="Override config values, e.g. --set train.lr=0.0003 model.num_layers=4")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
+    if args.overrides:
+        cfg = _apply_overrides(cfg, args.overrides)
     seed = int(cfg.get("seed", 42))
 
     train_cfg = cfg["train"]
@@ -859,7 +887,7 @@ def main() -> None:
         if is_main:
             print("Token-cache mode enabled: using on-disk tokenized corpora for large-scale training.")
 
-    resume_from = train_cfg.get("resume_from")
+    resume_from = args.resume or train_cfg.get("resume_from")
     resume_ckpt: dict[str, Any] | None = None
 
     def ensure_tokenizer_seed_text() -> str:
@@ -1115,6 +1143,7 @@ def main() -> None:
     )
     v2_commitment = str(model_cfg.get("plan_commitment", "soft"))
     v2_commitment_warmup_steps = int(model_cfg.get("commitment_warmup_steps", 0))
+    v2_commitment_ramp_steps = int(model_cfg.get("commitment_ramp_steps", 0))
     v2_plan_temperature_start = float(model_cfg.get("plan_temperature_start", model_cfg.get("plan_temperature", 1.0)))
     v2_plan_temperature_end = float(model_cfg.get("plan_temperature_end", v2_plan_temperature_start))
     if model_version == MODEL_VERSION_V2:
@@ -1315,17 +1344,23 @@ def main() -> None:
                     elif model_version == MODEL_VERSION_V2:
                         progress_frac = float(global_step) / float(max(max_steps - 1, 1))
                         current_plan_temp = lerp(v2_plan_temperature_start, v2_plan_temperature_end, progress_frac)
-                        current_commitment = (
-                            "soft"
-                            if (v2_commitment == "gumbel_st" and global_step < v2_commitment_warmup_steps)
-                            else v2_commitment
-                        )
+                        if v2_commitment == "gumbel_st" and global_step < v2_commitment_warmup_steps:
+                            current_commitment = "soft"
+                            current_hard_frac = 0.0
+                        elif v2_commitment == "gumbel_st" and v2_commitment_ramp_steps > 0:
+                            ramp_progress = float(global_step - v2_commitment_warmup_steps) / float(v2_commitment_ramp_steps)
+                            current_hard_frac = max(0.0, min(1.0, ramp_progress))
+                            current_commitment = v2_commitment
+                        else:
+                            current_commitment = v2_commitment
+                            current_hard_frac = 1.0
                         nll, aux = core_model.compute_losses(
                             x,
                             y,
                             planner_mode="normal",
                             commitment=current_commitment,
                             planner_temperature=current_plan_temp,
+                            commitment_hard_fraction=current_hard_frac,
                             rep_unlikelihood_window=effective_v2_rep_unlikelihood_window,
                         )
                         chunk_warm = 1.0

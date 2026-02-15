@@ -140,12 +140,17 @@ class APELRV2Model(nn.Module):
         forced_state: int | None = None,
         commitment: str = "soft",
         planner_temperature: float = 1.0,
+        commitment_hard_fraction: float = 1.0,
         training: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
         - states used for token gating [B, C, K]
         - posterior beliefs [B, C, K] before optional hard commitment
+
+        ``commitment_hard_fraction`` (0..1) linearly interpolates between
+        soft Gumbel samples (0) and straight-through hard one-hot (1),
+        enabling a gradual transition that avoids gradient spikes.
         """
         bsz, num_chunks, _ = chunk_summary.shape
         device = chunk_summary.device
@@ -180,7 +185,16 @@ class APELRV2Model(nn.Module):
             else:
                 if commitment == "gumbel_st" and training:
                     tau = max(float(planner_temperature), 1e-4)
-                    state = F.gumbel_softmax((posterior + self.eps).log(), tau=tau, hard=True, dim=-1)
+                    logits = (posterior + self.eps).log()
+                    hard_frac = max(0.0, min(1.0, float(commitment_hard_fraction)))
+                    if hard_frac >= 1.0:
+                        state = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
+                    elif hard_frac <= 0.0:
+                        state = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
+                    else:
+                        soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
+                        hard = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
+                        state = (1.0 - hard_frac) * soft + hard_frac * hard
                 else:
                     state = posterior
 
@@ -357,6 +371,7 @@ class APELRV2Model(nn.Module):
         forced_state: int | None = None,
         commitment: str = "soft",
         planner_temperature: float | None = None,
+        commitment_hard_fraction: float = 1.0,
         lookahead_steps: int | None = None,
         lookahead_feedback_scale: float | None = None,
         token_filtering: bool | None = None,
@@ -428,7 +443,16 @@ class APELRV2Model(nn.Module):
                 chunk_states.append(forced)
                 return forced
             if commitment == "gumbel_st" and self.training:
-                state = F.gumbel_softmax(self._belief_log(belief_in), tau=planner_tau, hard=True, dim=-1)
+                logits = self._belief_log(belief_in)
+                hard_frac = max(0.0, min(1.0, float(commitment_hard_fraction)))
+                if hard_frac >= 1.0:
+                    state = F.gumbel_softmax(logits, tau=planner_tau, hard=True, dim=-1)
+                elif hard_frac <= 0.0:
+                    state = F.gumbel_softmax(logits, tau=planner_tau, hard=False, dim=-1)
+                else:
+                    soft = F.gumbel_softmax(logits, tau=planner_tau, hard=False, dim=-1)
+                    hard = F.gumbel_softmax(logits, tau=planner_tau, hard=True, dim=-1)
+                    state = (1.0 - hard_frac) * soft + hard_frac * hard
                 chunk_states.append(state)
                 return state
             chunk_states.append(belief_in)

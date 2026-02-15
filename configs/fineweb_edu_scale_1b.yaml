@@ -46,6 +46,7 @@ model:
   future_horizon_chunks: 2
   plan_commitment: gumbel_st
   commitment_warmup_steps: 2000
+  commitment_ramp_steps: 2000
   plan_temperature_start: 1.10
   plan_temperature_end: 0.70
   token_filtering: true
