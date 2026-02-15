@@ -164,6 +164,7 @@ Important knobs:
 34. `train.compile.enabled`: toggles `torch.compile` for training speedups when supported.
 35. `train.eval_planner_diagnostics`: include expensive V2 planner intervention diagnostics during periodic eval.
 36. `train.final_eval_planner_diagnostics`: include planner diagnostics in final eval/metrics writeout.
+37. `train.max_nonfinite_steps`: max consecutive non-finite train steps before aborting with a clear stabilization error.
 
 ## Large-Scale Training
 

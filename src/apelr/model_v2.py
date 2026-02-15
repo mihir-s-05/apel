@@ -809,12 +809,18 @@ class APELRV2Model(nn.Module):
                     filtered[sorted_idx[keep]] = probs[sorted_idx[keep]]
                     probs = filtered
 
+                probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+                probs = torch.clamp(probs, min=0.0)
                 probs_sum = probs.sum()
-                if probs_sum <= 0:
-                    probs = F.softmax(mix_log, dim=-1)
+                if (not bool(torch.isfinite(probs_sum).item())) or float(probs_sum.item()) <= 0.0:
+                    mix_log_safe = torch.nan_to_num(mix_log, nan=-1.0e9, posinf=1.0e9, neginf=-1.0e9)
+                    if bool(torch.isfinite(mix_log_safe).any().item()):
+                        next_id = int(torch.argmax(mix_log_safe).item())
+                    else:
+                        next_id = int(torch.randint(0, self.vocab_size, (1,), device=device).item())
                 else:
                     probs = probs / probs_sum
-                next_id = int(torch.multinomial(probs, 1).item())
+                    next_id = int(torch.multinomial(probs, 1).item())
 
                 seq.append(next_id)
                 if use_token_filtering and (not freeze_planner) and force_state is None:

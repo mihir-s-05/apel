@@ -157,6 +157,15 @@ def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
         group["lr"] = lr
 
 
+def _all_finite_tensors(loss: torch.Tensor, aux: dict[str, torch.Tensor]) -> bool:
+    if not bool(torch.isfinite(loss.detach()).all().item()):
+        return False
+    for value in aux.values():
+        if isinstance(value, torch.Tensor) and not bool(torch.isfinite(value.detach()).all().item()):
+            return False
+    return True
+
+
 def cosine_lr_with_warmup(
     *,
     step: int,
@@ -624,44 +633,47 @@ def maybe_sample_preview(
     max_new_tokens: int,
 ) -> str:
     prompt_ids = [tokenizer.bos_id] + tokenizer.encode(prompt, add_bos=False, add_eos=False)
-    if model_version == MODEL_VERSION_V1:
-        sample_ids, _ = model.generate_filtered(
-            prompt_ids=prompt_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=0.9,
-            top_k=40,
-            top_p=0.95,
-            eos_id=tokenizer.eos_id,
-            lookahead_steps=1,
-            repetition_penalty=1.05,
-            no_repeat_ngram_size=3,
-        )
-    elif model_version == MODEL_VERSION_V2:
-        sample_ids, _ = model.generate_planned(
-            prompt_ids=prompt_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=0.9,
-            top_k=40,
-            top_p=0.95,
-            eos_id=tokenizer.eos_id,
-            lookahead_steps=1,
-            planner_temperature=1.0,
-            repetition_penalty=1.05,
-            no_repeat_ngram_size=3,
-        )
-    elif model_version == MODEL_VERSION_TRANSFORMER:
-        sample_ids = model.generate(
-            prompt_ids=prompt_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=0.9,
-            top_k=40,
-            top_p=0.95,
-            eos_id=tokenizer.eos_id,
-            repetition_penalty=1.05,
-            no_repeat_ngram_size=3,
-        )
-    else:
-        raise ValueError(f"Unsupported model version '{model_version}'.")
+    try:
+        if model_version == MODEL_VERSION_V1:
+            sample_ids, _ = model.generate_filtered(
+                prompt_ids=prompt_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=0.9,
+                top_k=40,
+                top_p=0.95,
+                eos_id=tokenizer.eos_id,
+                lookahead_steps=1,
+                repetition_penalty=1.05,
+                no_repeat_ngram_size=3,
+            )
+        elif model_version == MODEL_VERSION_V2:
+            sample_ids, _ = model.generate_planned(
+                prompt_ids=prompt_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=0.9,
+                top_k=40,
+                top_p=0.95,
+                eos_id=tokenizer.eos_id,
+                lookahead_steps=1,
+                planner_temperature=1.0,
+                repetition_penalty=1.05,
+                no_repeat_ngram_size=3,
+            )
+        elif model_version == MODEL_VERSION_TRANSFORMER:
+            sample_ids = model.generate(
+                prompt_ids=prompt_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=0.9,
+                top_k=40,
+                top_p=0.95,
+                eos_id=tokenizer.eos_id,
+                repetition_penalty=1.05,
+                no_repeat_ngram_size=3,
+            )
+        else:
+            raise ValueError(f"Unsupported model version '{model_version}'.")
+    except Exception as exc:
+        return f"[preview skipped: sampling failed ({exc.__class__.__name__}: {exc})]"
     return tokenizer.decode(sample_ids)
 
 
@@ -986,8 +998,14 @@ def main() -> None:
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
         allow_tf32 = bool(train_cfg.get("allow_tf32", True))
-        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
-        torch.backends.cudnn.allow_tf32 = allow_tf32
+        if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+            torch.backends.cuda.matmul.fp32_precision = "tf32" if allow_tf32 else "ieee"
+        elif hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        if hasattr(torch.backends.cudnn, "conv") and hasattr(torch.backends.cudnn.conv, "fp32_precision"):
+            torch.backends.cudnn.conv.fp32_precision = "tf32" if allow_tf32 else "ieee"
+        elif hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = allow_tf32
         matmul_precision = str(train_cfg.get("matmul_precision", "high")).lower()
         if matmul_precision in {"highest", "high", "medium"}:
             torch.set_float32_matmul_precision(matmul_precision)
@@ -1137,6 +1155,8 @@ def main() -> None:
                 f"ignoring rep_window={v2_rep_unlikelihood_window} for faster training/eval."
             )
 
+    max_nonfinite_steps = max(int(train_cfg.get("max_nonfinite_steps", 3)), 1)
+
     loss_weights = {
         "entropy_reg": entropy_reg_weight,
         "usage_balance": usage_balance_weight,
@@ -1240,6 +1260,7 @@ def main() -> None:
     micro_step = 0
     epoch = 0
     tokens_seen = 0
+    consecutive_nonfinite_steps = 0
     optimizer.zero_grad(set_to_none=True)
     while global_step < max_steps:
         sampler = getattr(train_loader, "sampler", None)
@@ -1327,6 +1348,23 @@ def main() -> None:
                     else:
                         raise ValueError(f"Unsupported model version '{model_version}'.")
 
+                    if not _all_finite_tensors(loss, aux):
+                        consecutive_nonfinite_steps += 1
+                        optimizer.zero_grad(set_to_none=True)
+                        micro_step = 0
+                        if is_main:
+                            print(
+                                f"\n[warn] non-finite training values at step={global_step} "
+                                f"(consecutive={consecutive_nonfinite_steps}/{max_nonfinite_steps}); "
+                                "skipping update."
+                            )
+                        if consecutive_nonfinite_steps >= max_nonfinite_steps:
+                            raise RuntimeError(
+                                "Aborting: encountered repeated non-finite loss/aux values. "
+                                "Lower train.lr and/or adaptive_batch.max_batch_size, then resume from a clean checkpoint."
+                            )
+                        continue
+
                     loss_for_backward = loss / float(accum_steps)
 
                 if scaler.is_enabled():
@@ -1340,13 +1378,30 @@ def main() -> None:
 
             if scaler.is_enabled():
                 scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(core_model.parameters(), max_norm=grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(core_model.parameters(), max_norm=grad_clip)
+            if not bool(torch.isfinite(grad_norm).all().item()):
+                consecutive_nonfinite_steps += 1
+                optimizer.zero_grad(set_to_none=True)
+                micro_step = 0
+                if is_main:
+                    print(
+                        f"\n[warn] non-finite grad norm at step={global_step} "
+                        f"(consecutive={consecutive_nonfinite_steps}/{max_nonfinite_steps}); "
+                        "skipping optimizer step."
+                    )
+                if consecutive_nonfinite_steps >= max_nonfinite_steps:
+                    raise RuntimeError(
+                        "Aborting: encountered repeated non-finite gradients. "
+                        "Lower train.lr and/or adaptive_batch.max_batch_size, then resume from a clean checkpoint."
+                    )
+                continue
             if scaler.is_enabled():
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            consecutive_nonfinite_steps = 0
 
             global_step += 1
             if is_main:
