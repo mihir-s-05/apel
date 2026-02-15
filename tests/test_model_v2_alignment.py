@@ -43,7 +43,6 @@ class TestAPELRV2Alignment(unittest.TestCase):
             belief = model._apply_boundary_update(belief, trans, chunk_mean)
             chunk_hidden_buffer = []
 
-        # Consume the first context token so the hidden state matches generation semantics.
         tok0 = int(x[0].item())
         tok_t = torch.tensor([[tok0]], device=device, dtype=torch.long)
         out, hidden = model.backbone(model.token_emb(tok_t), hidden)
@@ -59,7 +58,7 @@ class TestAPELRV2Alignment(unittest.TestCase):
                 else torch.zeros((1, model.cfg.hidden_dim), device=device)
             )
             expert_logits = torch.stack([head(state) for head in model.expert_heads], dim=1)
-            expert_log_probs = F.log_softmax(expert_logits, dim=-1).squeeze(0)  # [K, V]
+            expert_log_probs = F.log_softmax(expert_logits, dim=-1).squeeze(0)
 
             gate, _ = model._planner_gate_with_lookahead(
                 belief,
@@ -77,7 +76,6 @@ class TestAPELRV2Alignment(unittest.TestCase):
                 obs_logp = expert_log_probs[:, tgt].unsqueeze(0)
                 belief = F.softmax(model._belief_log(belief) + obs_logp, dim=-1)
 
-            # Consume the observed next token (teacher forcing).
             tok_t = torch.tensor([[tgt]], device=device, dtype=torch.long)
             out, hidden = model.backbone(model.token_emb(tok_t), hidden)
             chunk_hidden_buffer.append(out[:, -1, :])
@@ -110,7 +108,6 @@ class TestAPELRV2Alignment(unittest.TestCase):
         model.eval()
 
         seq_len = 32
-        # Construct a consistent (x, y) LM training pair: y is x shifted by 1.
         stream = torch.randint(0, cfg.vocab_size, (seq_len + 1,), dtype=torch.long)
         x = stream[:-1]
         y = stream[1:]

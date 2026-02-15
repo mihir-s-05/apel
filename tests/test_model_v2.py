@@ -43,7 +43,6 @@ class TestAPELRV2(unittest.TestCase):
         )
         self.assertTrue(torch.isfinite(loss).item())
         loss.backward()
-        # A few representative parameters should receive finite gradients.
         for name, param in model.named_parameters():
             if param.grad is None:
                 continue

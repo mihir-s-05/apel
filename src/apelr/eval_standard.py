@@ -97,7 +97,6 @@ def _nll_sum_ids(
     ids: list[int],
     settings: EvalSettings,
 ) -> float:
-    # Sum over t of -log p(ids[t] | ids[:t]) for t >= 1.
     if len(ids) < 2:
         return 0.0
     x = torch.tensor(ids[:-1], device=settings.device, dtype=torch.long).unsqueeze(0)
@@ -209,7 +208,6 @@ def _v2_teacher_forced_log_probs(
             mix_t = torch.logsumexp(model._belief_log(gate_t).unsqueeze(-1) + expert_log_probs[:, t, :, :], dim=1)
             mix_steps.append(mix_t)
 
-            # Online token filtering update (teacher-forced on target_ids).
             tgt = target_ids[:, t]
             obs_logp = torch.gather(
                 expert_log_probs[:, t, :, :],
@@ -260,7 +258,7 @@ def _continuation_nll_sum_and_first_log_probs(
     y = torch.tensor(full_ids[1:], device=settings.device, dtype=torch.long).unsqueeze(0)
     start_t = max(int(prefix_len) - 1, 0)
 
-    log_probs = _teacher_forced_log_probs(model, model_version, x, y, settings)  # [1, T, V]
+    log_probs = _teacher_forced_log_probs(model, model_version, x, y, settings)
     sel = log_probs[:, start_t:, :]
     tgt = y[:, start_t:]
     lp = torch.gather(sel, dim=-1, index=tgt.unsqueeze(-1)).squeeze(-1)
@@ -275,7 +273,6 @@ def _truncate_prompt_keep_bos(
     cont_ids: list[int],
     max_input_len: int,
 ) -> list[int]:
-    # We feed input_ids of length <= max_input_len. Total ids length is max_input_len + 1.
     max_total = int(max_input_len) + 1
     keep_prompt = max_total - 1 - len(cont_ids)
     keep_prompt = max(0, int(keep_prompt))
@@ -284,8 +281,6 @@ def _truncate_prompt_keep_bos(
 
 
 def _truncate_continuation(cont_ids: list[int], *, max_input_len: int) -> list[int]:
-    # Ensure (BOS + prompt_tail + cont_ids) can fit in max_input_len+1 tokens by
-    # hard-capping the continuation when necessary (e.g., PIQA can be long under small BPE vocabs).
     max_total = int(max_input_len) + 1
     max_cont = max_total - 1
     if max_cont <= 0:
@@ -308,7 +303,6 @@ def _pick_join(ctx: str, ending: str) -> str:
 
 
 def _preprocess_hellaswag(doc: dict[str, Any]) -> dict[str, Any]:
-    # Match EleutherAI lm-evaluation-harness behavior.
     ctx = str(doc["ctx_a"]) + " " + str(doc["ctx_b"]).capitalize()
     endings = [str(e).capitalize() for e in doc["endings"]]
     endings = [e.replace(" [title]", ".") for e in endings]
@@ -382,7 +376,6 @@ def eval_wikitext_ppl(
     variant = "wikitext-2-raw-v1" if name == "wikitext2" else "wikitext-103-raw-v1"
     ds = load_dataset("Salesforce/wikitext", variant, split=split)
 
-    # Tokenize similarly to training (BOS once, then concatenate docs with double newlines).
     texts: list[str] = []
     for i in range(min(len(ds), max(settings.max_examples, 1_000_000))):
         s = str(ds[i].get("text", "")).strip()
@@ -489,9 +482,6 @@ def eval_piqa(
     tokenizer: TokenizerLike,
     settings: EvalSettings,
 ) -> dict[str, float]:
-    # lm-eval-harness piqa.yaml:
-    # doc_to_text: "Question: {{goal}}\nAnswer:"
-    # doc_to_choice: [sol1, sol2]
     ds = load_dataset("piqa", split="validation", trust_remote_code=True)
     upper = min(len(ds), int(settings.max_examples))
     correct = 0
@@ -536,10 +526,6 @@ def eval_social_iqa(
     tokenizer: TokenizerLike,
     settings: EvalSettings,
 ) -> dict[str, float]:
-    # lm-eval-harness siqa.yaml:
-    # doc_to_text: "Q: {{context}} {{question}}\nA:"
-    # doc_to_choice: [answerA, answerB, answerC]
-    # doc_to_target: label-1, target_delimiter: " "
     ds = load_dataset("social_i_qa", split="validation", trust_remote_code=True)
     upper = min(len(ds), int(settings.max_examples))
     correct = 0
@@ -595,7 +581,6 @@ def eval_hellaswag(
         ex = _preprocess_hellaswag(ds[i])
         prompt = str(ex["ctx"])
         choices = [_pick_join("", str(e)) for e in ex["endings"]]
-        # In harness, endings are scored as continuations to ctx (no extra label).
         choices = [_pick_join(" ", c).lstrip("\n") if not c.startswith(" ") else c for c in choices]
         scores_sum, scores_mean = _score_choices(
             model=model,
@@ -625,7 +610,6 @@ def eval_hellaswag(
 def _choice_target_index_from_label(choice_labels: list[str], answer_key: str) -> int:
     if answer_key in choice_labels:
         return int(choice_labels.index(answer_key))
-    # Some datasets use numeric keys.
     for i, lab in enumerate(choice_labels):
         if str(lab).strip().lower() == str(answer_key).strip().lower():
             return int(i)

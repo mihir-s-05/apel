@@ -76,10 +76,12 @@ train:
   max_steps: 200000
   log_interval: 50
   eval_interval: 2000
-  val_batches: 20
+  val_batches: 8
+  eval_planner_diagnostics: false
+  final_eval_planner_diagnostics: true
   preview_interval: 2000
   preview_prompt: "In a surprising turn,"
-  preview_tokens: 220
+  preview_tokens: 160
   loss_weights:
     usage_balance: 0.05
     boundary_entropy: 0.02
@@ -89,8 +91,18 @@ train:
     rep_window: 64
   save_interval: 5000
   save_optimizer_state: false
+  fused_adamw: true
+  allow_tf32: true
+  matmul_precision: high
+  compile:
+    enabled: true
+    mode: reduce-overhead
+    fullgraph: false
+    dynamic: false
   distributed:
     backend: nccl
     zero_optimizer: true
-  num_workers: 0
+  num_workers: 8
+  prefetch_factor: 4
+  persistent_workers: true
   pin_memory: true

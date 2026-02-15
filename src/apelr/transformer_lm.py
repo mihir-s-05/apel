@@ -37,12 +37,10 @@ class _CausalSelfAttention(nn.Module):
         bsz, seq_len, d_model = x.shape
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
-        # [B, T, D] -> [B, H, T, Hd]
         q = q.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         k = k.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Use PyTorch fused scaled-dot-product attention when available.
         attn = F.scaled_dot_product_attention(
             q,
             k,
@@ -105,7 +103,6 @@ class TransformerLM(nn.Module):
     def reset_parameters(self) -> None:
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
-        # Standard init for residual projections.
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, mean=0.0, std=0.02)
@@ -177,7 +174,7 @@ class TransformerLM(nn.Module):
         for _ in range(int(max_new_tokens)):
             ctx = seq[-self.max_seq_len :]
             x = torch.tensor(ctx, device=device, dtype=torch.long).unsqueeze(0)
-            logits = self.forward(x)[:, -1, :]  # [1, V]
+            logits = self.forward(x)[:, -1, :]
             logits = logits.squeeze(0)
 
             if repetition_penalty > 1.0 and seq:

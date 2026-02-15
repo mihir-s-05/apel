@@ -415,8 +415,6 @@ class APELRV2Model(nn.Module):
             t_end = min(int(seq_len) - 1, (int(chunk_idx) + 1) * int(self.chunk_size) - 2)
             return t_start, t_end
 
-        # Online planner/executor recursion (matches generation semantics), but
-        # evaluated in segments to keep compute in large tensor ops.
         belief = self._initial_belief(bsz, device)
         chunk_posts: list[torch.Tensor] = []
         chunk_states: list[torch.Tensor] = []
@@ -438,7 +436,6 @@ class APELRV2Model(nn.Module):
 
         belief = append_chunk_state(belief)
 
-        # Accumulate NLL without materializing the full [B, T, V] tensor.
         nll_sum = torch.zeros((), device=device, dtype=torch.float32)
         js_weighted_sum = torch.zeros((), device=device, dtype=torch.float32)
         js_token_total = 0
@@ -462,23 +459,21 @@ class APELRV2Model(nn.Module):
             tgt_seg = target_ids[:, t_start : t_end + 1]
             seg_len = int(tgt_seg.shape[1])
 
-            expert_log_probs_seg = self._expert_log_probs(h_seg)  # [B, L, K, V]
+            expert_log_probs_seg = self._expert_log_probs(h_seg)
 
-            # Expert separation metric (mean JS), weighted by tokens.
             js_seg = self._pairwise_js_div_loss(expert_log_probs_seg)
             js_weighted_sum = js_weighted_sum + js_seg.float() * float(bsz * seg_len)
             js_token_total += int(bsz * seg_len)
 
-            # Token-time evidence for filtering (teacher-forced on target_ids).
             obs_logp = torch.gather(
                 expert_log_probs_seg,
                 dim=-1,
                 index=tgt_seg.view(bsz, seg_len, 1, 1).expand(bsz, seg_len, self.num_plan_states, 1),
-            ).squeeze(-1)  # [B, L, K]
+            ).squeeze(-1)
 
             if effective_token_filtering and planner_mode == "normal":
-                log_u0 = self._belief_log(belief)  # [B, K]
-                log_u_after = log_u0.unsqueeze(1) + torch.cumsum(obs_logp, dim=1)  # [B, L, K]
+                log_u0 = self._belief_log(belief)
+                log_u_after = log_u0.unsqueeze(1) + torch.cumsum(obs_logp, dim=1)
                 log_u_before = torch.cat([log_u0.unsqueeze(1), log_u_after[:, :-1, :]], dim=1)
                 belief_before = F.softmax(log_u_before, dim=-1)
                 belief_end = F.softmax(log_u_after[:, -1, :], dim=-1)
@@ -517,8 +512,6 @@ class APELRV2Model(nn.Module):
         else:
             rep_unlikelihood = torch.zeros((), device=device)
 
-        # Aux terms use chunk-level states aligned to the chunk summaries (ignore any
-        # final "spillover" chunk that has no summary window in teacher forcing).
         chunk_posts_t = torch.stack(chunk_posts, dim=1)
         chunk_states_t = torch.stack(chunk_states, dim=1)
         if chunk_posts_t.shape[1] > chunk_summary.shape[1]:

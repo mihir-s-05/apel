@@ -57,9 +57,9 @@ train:
   batch_size: auto
   adaptive_batch:
     enabled: true
-    probe_batch_size: 1
+    probe_batch_size: 2
     min_batch_size: 1
-    max_batch_size: 16
+    max_batch_size: 48
     safety_factor: 0.9
     reprobe_interval_steps: 0
   grad_accum_steps: 1
@@ -72,11 +72,13 @@ train:
   grad_clip: 1.0
   max_steps: 20000
   log_interval: 20
-  eval_interval: 500
-  val_batches: 20
-  preview_interval: 500
+  eval_interval: 1000
+  val_batches: 8
+  eval_planner_diagnostics: false
+  final_eval_planner_diagnostics: true
+  preview_interval: 1000
   preview_prompt: "In a surprising turn,"
-  preview_tokens: 220
+  preview_tokens: 160
   loss_weights:
     usage_balance: 0.05
     boundary_entropy: 0.02
@@ -86,8 +88,18 @@ train:
     rep_window: 64
   save_interval: 1000
   save_optimizer_state: false
+  fused_adamw: true
+  allow_tf32: true
+  matmul_precision: high
+  compile:
+    enabled: true
+    mode: reduce-overhead
+    fullgraph: false
+    dynamic: false
   distributed:
     backend: nccl
-    zero_optimizer: true
-  num_workers: 0
+    zero_optimizer: false
+  num_workers: 8
+  prefetch_factor: 4
+  persistent_workers: true
   pin_memory: true

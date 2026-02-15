@@ -157,6 +157,13 @@ Important knobs:
 27. `train.adaptive_batch.enabled`: enable VRAM-based auto batch probe.
 28. `train.adaptive_batch.probe_batch_size`: micro-batch used for memory probing.
 29. `train.adaptive_batch.reprobe_interval_steps`: periodically re-probe and update batch size mid-run.
+30. `train.num_workers` / `train.prefetch_factor` / `train.persistent_workers`: DataLoader throughput knobs for better GPU feeding.
+31. `train.fused_adamw`: enable fused AdamW kernel on CUDA for faster optimizer steps.
+32. `train.allow_tf32`: allow TF32 matmul/cuDNN paths on Ampere/Hopper when available.
+33. `train.matmul_precision`: sets PyTorch float32 matmul precision (`highest`, `high`, `medium`).
+34. `train.compile.enabled`: toggles `torch.compile` for training speedups when supported.
+35. `train.eval_planner_diagnostics`: include expensive V2 planner intervention diagnostics during periodic eval.
+36. `train.final_eval_planner_diagnostics`: include planner diagnostics in final eval/metrics writeout.
 
 ## Large-Scale Training
 

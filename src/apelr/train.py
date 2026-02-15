@@ -444,6 +444,7 @@ def evaluate_v2(
     *,
     commitment: str,
     planner_temperature: float,
+    include_planner_diagnostics: bool = True,
 ) -> dict[str, float]:
     model.eval()
     losses: list[float] = []
@@ -475,33 +476,34 @@ def evaluate_v2(
                 lookahead_feedback_scale=lookahead_feedback_scale,
                 rep_unlikelihood_window=rep_unlikelihood_window,
             )
-            nll_no_feedback, _ = model.compute_losses(
-                x,
-                y,
-                planner_mode="normal",
-                commitment=commitment,
-                planner_temperature=planner_temperature,
-                lookahead_steps=lookahead_steps,
-                lookahead_feedback_scale=0.0,
-                rep_unlikelihood_window=rep_unlikelihood_window,
-            )
-            diag = model.planner_usage_metrics(
-                x,
-                y,
-                commitment=commitment,
-                planner_temperature=planner_temperature,
-            )
             losses.append(float(nll.item()))
             usage_kls.append(float(aux["usage_kl_to_uniform"].item()))
             boundary_ents.append(float(aux["boundary_entropy"].item()))
             future_losses.append(float(aux["future_contrastive_loss"].item()))
             js_losses.append(float(aux["plan_js_div_loss"].item()))
             repu_losses.append(float(aux["rep_unlikelihood_loss"].item()))
-            feedback_deltas.append(float((nll_no_feedback - nll).item()))
-            mask_deltas.append(float(diag["planner_mask_delta_loss"].item()))
-            force_divs.append(float(diag["forced_state_divergence"].item()))
             state_persist.append(float(aux["state_persistence"].item()))
             expert_utils.append(float(aux["expert_utilization"].item()))
+            if include_planner_diagnostics:
+                nll_no_feedback, _ = model.compute_losses(
+                    x,
+                    y,
+                    planner_mode="normal",
+                    commitment=commitment,
+                    planner_temperature=planner_temperature,
+                    lookahead_steps=lookahead_steps,
+                    lookahead_feedback_scale=0.0,
+                    rep_unlikelihood_window=rep_unlikelihood_window,
+                )
+                diag = model.planner_usage_metrics(
+                    x,
+                    y,
+                    commitment=commitment,
+                    planner_temperature=planner_temperature,
+                )
+                feedback_deltas.append(float((nll_no_feedback - nll).item()))
+                mask_deltas.append(float(diag["planner_mask_delta_loss"].item()))
+                force_divs.append(float(diag["forced_state_divergence"].item()))
     if not losses:
         return {
             "loss": float("nan"),
@@ -526,9 +528,9 @@ def evaluate_v2(
         "future_contrastive_loss": float(np.mean(future_losses)),
         "plan_js_div_loss": float(np.mean(js_losses)),
         "rep_unlikelihood_loss": float(np.mean(repu_losses)),
-        "feedback_delta_loss": float(np.mean(feedback_deltas)),
-        "planner_mask_delta_loss": float(np.mean(mask_deltas)),
-        "forced_state_divergence": float(np.mean(force_divs)),
+        "feedback_delta_loss": float(np.mean(feedback_deltas)) if feedback_deltas else float("nan"),
+        "planner_mask_delta_loss": float(np.mean(mask_deltas)) if mask_deltas else float("nan"),
+        "forced_state_divergence": float(np.mean(force_divs)) if force_divs else float("nan"),
         "state_persistence": float(np.mean(state_persist)),
         "expert_utilization": float(np.mean(expert_utils)),
     }
@@ -544,6 +546,7 @@ def evaluate_model(
     *,
     v2_commitment: str = "soft",
     v2_planner_temperature: float = 1.0,
+    include_planner_diagnostics: bool = True,
 ) -> dict[str, float]:
     if model_version == MODEL_VERSION_V1:
         return evaluate_v1(model, loader, device, max_batches)
@@ -556,8 +559,8 @@ def evaluate_model(
             rep_unlikelihood_window,
             commitment=v2_commitment,
             planner_temperature=v2_planner_temperature,
+            include_planner_diagnostics=include_planner_diagnostics,
         )
-    # Baseline decoder-only Transformer LM.
     if model_version == MODEL_VERSION_TRANSFORMER:
         model.eval()
         losses: list[float] = []
@@ -726,6 +729,18 @@ def build_loaders(
     ctx = dist_ctx or DistributedContext(enabled=False, rank=0, local_rank=0, world_size=1, backend="")
     num_workers = int(train_cfg.get("num_workers", 0))
     pin_memory = bool(train_cfg.get("pin_memory", False))
+    prefetch_factor_cfg = train_cfg.get("prefetch_factor")
+    pin_memory_device = train_cfg.get("pin_memory_device")
+    loader_kwargs: dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if pin_memory_device:
+        loader_kwargs["pin_memory_device"] = str(pin_memory_device)
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = bool(train_cfg.get("persistent_workers", True))
+        if prefetch_factor_cfg is not None:
+            loader_kwargs["prefetch_factor"] = max(int(prefetch_factor_cfg), 1)
     train_sampler = None
     if isinstance(train_ds, IterableDataset):
         if ctx.enabled and ctx.is_main:
@@ -734,8 +749,7 @@ def build_loaders(
             train_ds,
             batch_size=batch_size,
             drop_last=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
+            **loader_kwargs,
         )
     else:
         if ctx.enabled:
@@ -753,16 +767,14 @@ def build_loaders(
             shuffle=(train_sampler is None),
             sampler=train_sampler,
             drop_last=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
+            **loader_kwargs,
         )
     val_loader = DataLoader(
         val_ds,
         batch_size=batch_size,
         shuffle=False,
         drop_last=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        **loader_kwargs,
     )
     return train_loader, val_loader
 
@@ -973,6 +985,12 @@ def main() -> None:
     model = instantiate_model(model_cfg=model_cfg, vocab_size=tokenizer.vocab_size, model_version=model_version)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        allow_tf32 = bool(train_cfg.get("allow_tf32", True))
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+        matmul_precision = str(train_cfg.get("matmul_precision", "high")).lower()
+        if matmul_precision in {"highest", "high", "medium"}:
+            torch.set_float32_matmul_precision(matmul_precision)
     model.to(device)
 
     if is_main:
@@ -982,6 +1000,32 @@ def main() -> None:
         print(f"Model version: {model_version}")
         print(f"Model parameters: {model.count_parameters():,}")
         print(f"Train sequences: {len(train_ds):,}, Val sequences: {len(val_ds):,}")
+
+    compile_cfg = train_cfg.get("compile", {})
+    if isinstance(compile_cfg, bool):
+        compile_enabled = compile_cfg
+        compile_cfg = {}
+    else:
+        compile_enabled = bool(compile_cfg.get("enabled", False)) if isinstance(compile_cfg, dict) else False
+    if compile_enabled and hasattr(torch, "compile"):
+        compile_mode = str(compile_cfg.get("mode", "reduce-overhead"))
+        compile_fullgraph = bool(compile_cfg.get("fullgraph", False))
+        compile_dynamic = bool(compile_cfg.get("dynamic", False))
+        try:
+            model = torch.compile(
+                model,
+                mode=compile_mode,
+                fullgraph=compile_fullgraph,
+                dynamic=compile_dynamic,
+            )
+            if is_main:
+                print(
+                    "Enabled torch.compile "
+                    f"(mode={compile_mode}, fullgraph={compile_fullgraph}, dynamic={compile_dynamic})."
+                )
+        except Exception as exc:
+            if is_main:
+                print(f"Warning: torch.compile failed ({exc!r}); continuing without compile.")
 
     base_lr = float(train_cfg["lr"])
     weight_decay = float(train_cfg.get("weight_decay", 0.01))
@@ -995,20 +1039,25 @@ def main() -> None:
             print("Warning: train.distributed.zero_optimizer=true but distributed training is not enabled; using AdamW.")
         use_zero = False
 
+    use_fused_adamw = bool(train_cfg.get("fused_adamw", device.type == "cuda")) and device.type == "cuda"
+    adamw_kwargs: dict[str, Any] = {
+        "lr": base_lr,
+        "weight_decay": weight_decay,
+        "betas": (0.9, 0.95),
+    }
+    if use_fused_adamw:
+        adamw_kwargs["fused"] = True
+
     if dist_ctx.enabled and use_zero:
         optimizer = ZeroRedundancyOptimizer(
             model.parameters(),
             optimizer_class=AdamW,
-            lr=base_lr,
-            weight_decay=weight_decay,
-            betas=(0.9, 0.95),
+            **adamw_kwargs,
         )
     else:
         optimizer = AdamW(
             model.parameters(),
-            lr=base_lr,
-            weight_decay=weight_decay,
-            betas=(0.9, 0.95),
+            **adamw_kwargs,
         )
 
     grad_clip = float(train_cfg.get("grad_clip", 1.0))
@@ -1016,6 +1065,10 @@ def main() -> None:
     eval_interval = int(train_cfg.get("eval_interval", 200))
     log_interval = int(train_cfg.get("log_interval", 20))
     val_batches = int(train_cfg.get("val_batches", 20))
+    eval_planner_diagnostics = bool(train_cfg.get("eval_planner_diagnostics", True))
+    final_eval_planner_diagnostics = bool(
+        train_cfg.get("final_eval_planner_diagnostics", eval_planner_diagnostics)
+    )
     preview_interval = int(train_cfg.get("preview_interval", eval_interval))
     preview_prompt = str(train_cfg.get("preview_prompt", "Once upon a time"))
     preview_tokens = int(train_cfg.get("preview_tokens", 120))
@@ -1039,6 +1092,9 @@ def main() -> None:
     v2_usage_weight = float(v2_w.get("usage_balance", usage_balance_weight))
     v2_rep_unlikelihood_weight = float(v2_w.get("rep_unlikelihood", 0.0))
     v2_rep_unlikelihood_window = int(v2_w.get("rep_window", 0))
+    effective_v2_rep_unlikelihood_window = (
+        v2_rep_unlikelihood_window if v2_rep_unlikelihood_weight > 0.0 else 0
+    )
     v2_commitment = str(model_cfg.get("plan_commitment", "soft"))
     v2_commitment_warmup_steps = int(model_cfg.get("commitment_warmup_steps", 0))
     v2_plan_temperature_start = float(model_cfg.get("plan_temperature_start", model_cfg.get("plan_temperature", 1.0)))
@@ -1075,6 +1131,11 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and precision == "fp16"))
     if is_main:
         print(f"Precision: {precision}, grad_accum_steps: {grad_accum_steps}, use_amp: {use_amp}")
+        if v2_rep_unlikelihood_weight <= 0.0 and v2_rep_unlikelihood_window > 0:
+            print(
+                "Rep-unlikelihood disabled by weight=0; "
+                f"ignoring rep_window={v2_rep_unlikelihood_window} for faster training/eval."
+            )
 
     loss_weights = {
         "entropy_reg": entropy_reg_weight,
@@ -1102,7 +1163,7 @@ def main() -> None:
                 loss_weights=loss_weights,
                 v2_commitment=v2_commitment,
                 v2_plan_temperature=v2_plan_temperature_start,
-                v2_rep_unlikelihood_window=v2_rep_unlikelihood_window,
+                v2_rep_unlikelihood_window=effective_v2_rep_unlikelihood_window,
             )
         else:
             batch_size = 0
@@ -1119,7 +1180,7 @@ def main() -> None:
             loss_weights=loss_weights,
             v2_commitment=v2_commitment,
             v2_plan_temperature=v2_plan_temperature_start,
-            v2_rep_unlikelihood_window=v2_rep_unlikelihood_window,
+            v2_rep_unlikelihood_window=effective_v2_rep_unlikelihood_window,
         )
 
     train_loader, val_loader = build_loaders(
@@ -1244,7 +1305,7 @@ def main() -> None:
                             planner_mode="normal",
                             commitment=current_commitment,
                             planner_temperature=current_plan_temp,
-                            rep_unlikelihood_window=v2_rep_unlikelihood_window,
+                            rep_unlikelihood_window=effective_v2_rep_unlikelihood_window,
                         )
                         chunk_warm = 1.0
                         effective_chunk_bow_weight = 0.0
@@ -1306,7 +1367,7 @@ def main() -> None:
                                 loss_weights=loss_weights,
                                 v2_commitment=v2_commitment,
                                 v2_plan_temperature=v2_plan_temperature_start,
-                                v2_rep_unlikelihood_window=v2_rep_unlikelihood_window,
+                                v2_rep_unlikelihood_window=effective_v2_rep_unlikelihood_window,
                             )
                     else:
                         new_batch_size = 0
@@ -1323,7 +1384,7 @@ def main() -> None:
                         loss_weights=loss_weights,
                         v2_commitment=v2_commitment,
                         v2_plan_temperature=v2_plan_temperature_start,
-                        v2_rep_unlikelihood_window=v2_rep_unlikelihood_window,
+                        v2_rep_unlikelihood_window=effective_v2_rep_unlikelihood_window,
                     )
                 if new_batch_size != batch_size:
                     batch_size = new_batch_size
@@ -1399,9 +1460,10 @@ def main() -> None:
                         val_loader,
                         device,
                         max_batches=val_batches,
-                        rep_unlikelihood_window=v2_rep_unlikelihood_window,
+                        rep_unlikelihood_window=effective_v2_rep_unlikelihood_window,
                         v2_commitment=eval_commitment,
                         v2_planner_temperature=eval_plan_temp,
+                        include_planner_diagnostics=eval_planner_diagnostics,
                     )
                     if model_version == MODEL_VERSION_V1:
                         print(
@@ -1499,7 +1561,7 @@ def main() -> None:
             val_loader,
             device,
             max_batches=val_batches,
-            rep_unlikelihood_window=v2_rep_unlikelihood_window,
+            rep_unlikelihood_window=effective_v2_rep_unlikelihood_window,
             v2_commitment=(
                 "soft"
                 if (
@@ -1514,6 +1576,7 @@ def main() -> None:
                 v2_plan_temperature_end,
                 float(global_step) / float(max(max_steps - 1, 1)),
             ),
+            include_planner_diagnostics=final_eval_planner_diagnostics,
         )
         (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         if model_version == MODEL_VERSION_V2:
