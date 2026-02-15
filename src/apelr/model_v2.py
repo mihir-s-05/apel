@@ -100,6 +100,37 @@ class APELRV2Model(nn.Module):
     def _belief_log(self, belief: torch.Tensor) -> torch.Tensor:
         return (belief + self.eps).log()
 
+    def _sample_gumbel_state(
+        self,
+        logits: torch.Tensor,
+        *,
+        tau: float,
+        hard_fraction: float,
+    ) -> torch.Tensor:
+        """
+        Sample planner states with numerically stable Gumbel-ST under AMP.
+
+        We always sample in fp32 to avoid bf16/fp16 overflow/underflow in the
+        Gumbel noise path, then cast back to the model dtype.
+        """
+        hard_frac = max(0.0, min(1.0, float(hard_fraction)))
+        logits_fp32 = logits.float()
+        if hard_frac >= 1.0:
+            sample = F.gumbel_softmax(logits_fp32, tau=tau, hard=True, dim=-1)
+        elif hard_frac <= 0.0:
+            sample = F.gumbel_softmax(logits_fp32, tau=tau, hard=False, dim=-1)
+        else:
+            soft = F.gumbel_softmax(logits_fp32, tau=tau, hard=False, dim=-1)
+            one_hot = torch.zeros_like(soft).scatter_(-1, soft.argmax(-1, keepdim=True), 1.0)
+            hard = (one_hot - soft).detach() + soft
+            sample = (1.0 - hard_frac) * soft + hard_frac * hard
+
+        sample = torch.nan_to_num(sample, nan=0.0, posinf=0.0, neginf=0.0)
+        denom = sample.sum(dim=-1, keepdim=True)
+        uniform = torch.full_like(sample, 1.0 / float(sample.shape[-1]))
+        sample = torch.where(denom > self.eps, sample / denom.clamp_min(self.eps), uniform)
+        return sample.to(dtype=logits.dtype)
+
     def _initial_belief(self, batch_size: int, device: torch.device) -> torch.Tensor:
         pi0 = F.softmax(self.planner_init_logits, dim=-1)
         return pi0.unsqueeze(0).expand(batch_size, -1).to(device)
@@ -186,17 +217,11 @@ class APELRV2Model(nn.Module):
                 if commitment == "gumbel_st" and training:
                     tau = max(float(planner_temperature), 1e-4)
                     logits = (posterior + self.eps).log()
-                    hard_frac = max(0.0, min(1.0, float(commitment_hard_fraction)))
-                    if hard_frac >= 1.0:
-                        state = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
-                    elif hard_frac <= 0.0:
-                        state = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
-                    else:
-                        # Single noise sample: get soft, derive hard via straight-through
-                        soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
-                        one_hot = torch.zeros_like(soft).scatter_(-1, soft.argmax(-1, keepdim=True), 1.0)
-                        hard = (one_hot - soft).detach() + soft
-                        state = (1.0 - hard_frac) * soft + hard_frac * hard
+                    state = self._sample_gumbel_state(
+                        logits,
+                        tau=tau,
+                        hard_fraction=commitment_hard_fraction,
+                    )
                 else:
                     state = posterior
 
@@ -446,17 +471,11 @@ class APELRV2Model(nn.Module):
                 return forced
             if commitment == "gumbel_st" and self.training:
                 logits = self._belief_log(belief_in)
-                hard_frac = max(0.0, min(1.0, float(commitment_hard_fraction)))
-                if hard_frac >= 1.0:
-                    state = F.gumbel_softmax(logits, tau=planner_tau, hard=True, dim=-1)
-                elif hard_frac <= 0.0:
-                    state = F.gumbel_softmax(logits, tau=planner_tau, hard=False, dim=-1)
-                else:
-                    # Single noise sample: get soft, derive hard via straight-through
-                    soft = F.gumbel_softmax(logits, tau=planner_tau, hard=False, dim=-1)
-                    one_hot = torch.zeros_like(soft).scatter_(-1, soft.argmax(-1, keepdim=True), 1.0)
-                    hard = (one_hot - soft).detach() + soft
-                    state = (1.0 - hard_frac) * soft + hard_frac * hard
+                state = self._sample_gumbel_state(
+                    logits,
+                    tau=planner_tau,
+                    hard_fraction=commitment_hard_fraction,
+                )
                 chunk_states.append(state)
                 return state
             chunk_states.append(belief_in)

@@ -9,6 +9,33 @@ sys.path.append(str(REPO_ROOT / "src"))
 
 
 class TestAPELRV2(unittest.TestCase):
+    def test_sample_gumbel_state_bf16_is_finite_and_normalized(self) -> None:
+        import torch
+
+        from apelr.model_v2 import APELRV2Model, APELRV2ModelConfig
+
+        torch.manual_seed(0)
+        cfg = APELRV2ModelConfig(
+            vocab_size=64,
+            num_plan_states=4,
+            num_experts=4,
+            chunk_size=4,
+            token_dim=16,
+            hidden_dim=32,
+            num_layers=1,
+            dropout=0.0,
+            async_planner=False,
+        )
+        model = APELRV2Model(cfg)
+        logits = torch.randn(128, cfg.num_plan_states, dtype=torch.bfloat16)
+        for hard_fraction in (0.0, 0.5, 1.0):
+            for _ in range(8):
+                state = model._sample_gumbel_state(logits, tau=1.0, hard_fraction=hard_fraction)
+                self.assertEqual(state.dtype, logits.dtype)
+                self.assertTrue(torch.isfinite(state).all().item())
+                row_sums = state.float().sum(dim=-1)
+                self.assertTrue(torch.allclose(row_sums, torch.ones_like(row_sums), atol=1e-3, rtol=1e-3))
+
     def test_compute_losses_runs_and_backprop(self) -> None:
         import torch
 
