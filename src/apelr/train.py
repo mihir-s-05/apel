@@ -1417,6 +1417,8 @@ def main() -> None:
             if not bool(torch.isfinite(grad_norm).all().item()):
                 consecutive_nonfinite_steps += 1
                 optimizer.zero_grad(set_to_none=True)
+                if scaler.is_enabled():
+                    scaler.update()
                 micro_step = 0
                 if is_main:
                     print(
