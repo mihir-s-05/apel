@@ -189,6 +189,31 @@ def _all_finite_tensors(loss: torch.Tensor, aux: dict[str, torch.Tensor]) -> boo
     return True
 
 
+def _sanitize_nonfinite_gradients(model: torch.nn.Module) -> tuple[int, int]:
+    """
+    Replace NaN/Inf gradient entries with zeros in-place.
+
+    Returns:
+    - number of gradient tensors that contained non-finite values
+    - number of non-finite gradient elements that were zeroed
+    """
+    bad_tensors = 0
+    bad_elements = 0
+    with torch.no_grad():
+        for param in model.parameters():
+            grad = param.grad
+            if grad is None:
+                continue
+            finite = torch.isfinite(grad)
+            if bool(finite.all().item()):
+                continue
+            bad_tensors += 1
+            mask = ~finite
+            bad_elements += int(mask.sum().item())
+            grad.masked_fill_(mask, 0.0)
+    return bad_tensors, bad_elements
+
+
 def cosine_lr_with_warmup(
     *,
     step: int,
@@ -1144,6 +1169,10 @@ def main() -> None:
     v2_commitment = str(model_cfg.get("plan_commitment", "soft"))
     v2_commitment_warmup_steps = int(model_cfg.get("commitment_warmup_steps", 0))
     v2_commitment_ramp_steps = int(model_cfg.get("commitment_ramp_steps", 0))
+    v2_commitment_max_hard_fraction = max(
+        0.0,
+        min(1.0, float(model_cfg.get("commitment_max_hard_fraction", 1.0))),
+    )
     v2_plan_temperature_start = float(model_cfg.get("plan_temperature_start", model_cfg.get("plan_temperature", 1.0)))
     v2_plan_temperature_end = float(model_cfg.get("plan_temperature_end", v2_plan_temperature_start))
     if model_version == MODEL_VERSION_V2:
@@ -1178,6 +1207,8 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and precision == "fp16"))
     if is_main:
         print(f"Precision: {precision}, grad_accum_steps: {grad_accum_steps}, use_amp: {use_amp}")
+        if model_version == MODEL_VERSION_V2 and v2_commitment == "gumbel_st":
+            print(f"Gumbel-ST hard-fraction cap: {v2_commitment_max_hard_fraction:.3f}")
         if v2_rep_unlikelihood_weight <= 0.0 and v2_rep_unlikelihood_window > 0:
             print(
                 "Rep-unlikelihood disabled by weight=0; "
@@ -1349,11 +1380,14 @@ def main() -> None:
                             current_hard_frac = 0.0
                         elif v2_commitment == "gumbel_st" and v2_commitment_ramp_steps > 0:
                             ramp_progress = float(global_step - v2_commitment_warmup_steps) / float(v2_commitment_ramp_steps)
-                            current_hard_frac = max(0.0, min(1.0, ramp_progress))
+                            current_hard_frac = min(
+                                v2_commitment_max_hard_fraction,
+                                max(0.0, min(1.0, ramp_progress)),
+                            )
                             current_commitment = v2_commitment
                         else:
                             current_commitment = v2_commitment
-                            current_hard_frac = 1.0
+                            current_hard_frac = v2_commitment_max_hard_fraction
                         nll, aux = core_model.compute_losses(
                             x,
                             y,
@@ -1413,6 +1447,12 @@ def main() -> None:
 
             if scaler.is_enabled():
                 scaler.unscale_(optimizer)
+            sanitized_tensors, sanitized_elements = _sanitize_nonfinite_gradients(core_model)
+            if sanitized_tensors > 0 and is_main:
+                print(
+                    f"\n[warn] sanitized non-finite gradients at step={global_step} "
+                    f"(tensors={sanitized_tensors}, elements={sanitized_elements})."
+                )
             grad_norm = torch.nn.utils.clip_grad_norm_(core_model.parameters(), max_norm=grad_clip)
             if not bool(torch.isfinite(grad_norm).all().item()):
                 consecutive_nonfinite_steps += 1

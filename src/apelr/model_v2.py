@@ -349,37 +349,46 @@ class APELRV2Model(nn.Module):
         if horizon <= 0:
             return torch.zeros((), device=chunk_summary.device)
 
-        plan_vec = chunk_states @ self.plan_state_emb.weight
-        plan_vec = F.normalize(plan_vec, dim=-1)
-        future_vec = F.normalize(self.future_chunk_proj(chunk_summary), dim=-1)
+        # Keep this path in fp32: tiny vector norms can create extreme gradients
+        # under bf16/fp16 when using default normalize eps.
+        norm_eps = max(float(self.eps), 1e-6)
+        plan_vec = torch.matmul(chunk_states.float(), self.plan_state_emb.weight.float())
+        plan_vec = F.normalize(plan_vec, dim=-1, eps=norm_eps)
+        future_proj = F.linear(
+            chunk_summary.float(),
+            self.future_chunk_proj.weight.float(),
+            self.future_chunk_proj.bias.float() if self.future_chunk_proj.bias is not None else None,
+        )
+        future_vec = F.normalize(future_proj, dim=-1, eps=norm_eps)
+        temp = max(float(temperature), 1e-3)
 
         losses: list[torch.Tensor] = []
         for d in range(1, horizon + 1):
-             anchor = plan_vec[:, :-d, :].reshape(-1, plan_vec.shape[-1])
-             positive = future_vec[:, d:, :].reshape(-1, future_vec.shape[-1])
-             if anchor.numel() == 0:
-                 continue
-             logits = anchor @ positive.t()
-             logits = logits / max(float(temperature), 1e-4)
-             labels = torch.arange(anchor.shape[0], device=anchor.device)
-             losses.append(F.cross_entropy(logits, labels))
+            anchor = plan_vec[:, :-d, :].reshape(-1, plan_vec.shape[-1])
+            positive = future_vec[:, d:, :].reshape(-1, future_vec.shape[-1])
+            if anchor.numel() == 0:
+                continue
+            logits = (anchor @ positive.t()) / temp
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0e4, neginf=-1.0e4)
+            labels = torch.arange(anchor.shape[0], device=anchor.device)
+            losses.append(F.cross_entropy(logits, labels))
         if not losses:
             return torch.zeros((), device=chunk_summary.device)
         return torch.stack(losses).mean()
 
     def _pairwise_js_div_loss(self, expert_log_probs: torch.Tensor) -> torch.Tensor:
-        probs = expert_log_probs.exp().reshape(-1, self.num_experts, self.vocab_size)
-        logs = expert_log_probs.reshape(-1, self.num_experts, self.vocab_size)
+        probs = expert_log_probs.float().exp().reshape(-1, self.num_experts, self.vocab_size)
+        probs = probs.clamp_min(float(self.eps))
         num_pairs = 0
         js_sum = torch.zeros((), device=expert_log_probs.device)
         for i in range(self.num_experts):
             pi = probs[:, i, :]
-            lpi = logs[:, i, :]
+            lpi = pi.log()
             for j in range(i + 1, self.num_experts):
                 pj = probs[:, j, :]
-                lpj = logs[:, j, :]
+                lpj = pj.log()
                 m = 0.5 * (pi + pj)
-                lm = (m + self.eps).log()
+                lm = m.clamp_min(float(self.eps)).log()
                 kl_im = torch.sum(pi * (lpi - lm), dim=-1)
                 kl_jm = torch.sum(pj * (lpj - lm), dim=-1)
                 js = 0.5 * (kl_im + kl_jm)

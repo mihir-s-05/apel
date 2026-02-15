@@ -43,7 +43,8 @@ model:
   future_horizon_chunks: 3
   plan_commitment: gumbel_st
   commitment_warmup_steps: 500
-  commitment_ramp_steps: 1000
+  commitment_ramp_steps: 2000
+  commitment_max_hard_fraction: 0.85
   plan_temperature_start: 1.20
   plan_temperature_end: 0.80
   token_filtering: true
@@ -60,7 +61,7 @@ train:
     enabled: true
     probe_batch_size: 2
     min_batch_size: 1
-    max_batch_size: 16
+    max_batch_size: 12
     safety_factor: 0.9
     reprobe_interval_steps: 0
   grad_accum_steps: 1
