@@ -192,8 +192,10 @@ class APELRV2Model(nn.Module):
                     elif hard_frac <= 0.0:
                         state = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
                     else:
+                        # Single noise sample: get soft, derive hard via straight-through
                         soft = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
-                        hard = F.gumbel_softmax(logits, tau=tau, hard=True, dim=-1)
+                        one_hot = torch.zeros_like(soft).scatter_(-1, soft.argmax(-1, keepdim=True), 1.0)
+                        hard = (one_hot - soft).detach() + soft
                         state = (1.0 - hard_frac) * soft + hard_frac * hard
                 else:
                     state = posterior
@@ -450,8 +452,10 @@ class APELRV2Model(nn.Module):
                 elif hard_frac <= 0.0:
                     state = F.gumbel_softmax(logits, tau=planner_tau, hard=False, dim=-1)
                 else:
+                    # Single noise sample: get soft, derive hard via straight-through
                     soft = F.gumbel_softmax(logits, tau=planner_tau, hard=False, dim=-1)
-                    hard = F.gumbel_softmax(logits, tau=planner_tau, hard=True, dim=-1)
+                    one_hot = torch.zeros_like(soft).scatter_(-1, soft.argmax(-1, keepdim=True), 1.0)
+                    hard = (one_hot - soft).detach() + soft
                     state = (1.0 - hard_frac) * soft + hard_frac * hard
                 chunk_states.append(state)
                 return state

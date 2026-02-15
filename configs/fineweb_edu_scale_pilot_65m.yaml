@@ -60,12 +60,12 @@ train:
     enabled: true
     probe_batch_size: 2
     min_batch_size: 1
-    max_batch_size: 48
+    max_batch_size: 16
     safety_factor: 0.9
     reprobe_interval_steps: 0
   grad_accum_steps: 1
   precision: bf16
-  lr: 0.00006
+  lr: 0.00003
   lr_schedule: cosine
   warmup_steps: 500
   min_lr_ratio: 0.1
@@ -88,7 +88,7 @@ train:
     rep_unlikelihood: 0.0
     rep_window: 64
   save_interval: 200
-  save_optimizer_state: false
+  save_optimizer_state: true
   max_nonfinite_steps: 5
   fused_adamw: true
   allow_tf32: true
