@@ -42,7 +42,7 @@ model:
   planner_context_scale: 1.0
   future_horizon_chunks: 3
   plan_commitment: gumbel_st
-  commitment_warmup_steps: 500
+  commitment_warmup_steps: 1000
   plan_temperature_start: 1.15
   plan_temperature_end: 0.75
   token_filtering: true
@@ -64,7 +64,7 @@ train:
     reprobe_interval_steps: 0
   grad_accum_steps: 1
   precision: bf16
-  lr: 0.0001
+  lr: 0.00006
   lr_schedule: cosine
   warmup_steps: 1000
   min_lr_ratio: 0.1
